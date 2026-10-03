@@ -1,0 +1,95 @@
+name: Windows visual preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the portable ZIP as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-visual-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      QT: '5.15.19'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: TBuild/tdesktop
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install the supported CMake version
+        run: |
+          python -m pip install cmake==3.31.6
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        with:
+          path: |
+            TBuild/Libraries/win64
+            TBuild/ThirdParty
+          key: win2022-v143-14.44-sdk26100-qt5-debug-v1-${{ hashFiles('TBuild/tdesktop/Telegram/build/prepare/prepare.py', 'TBuild/tdesktop/Telegram/build/qt_version.py', 'TBuild/tdesktop/.github/scripts/cloud-build.ps1') }}
+      - name: Prepare build tools
+        run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 bootstrap
+      - name: Compile dependencies
+        run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 dependencies
+      - uses: actions/cache/save@v4
+        if: always() && !cancelled() && steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: |
+            TBuild/Libraries/win64
+            TBuild/ThirdParty
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+      - name: Compile VisuGram Debug
+        env:
+          VISUGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          VISUGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 build
+      - name: Package the portable client
+        run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VisuGram-windows-x64
+          path: TBuild/tdesktop/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: inputs.publish_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: VisuGram-windows-x64
+          path: dist
+      - name: Publish the preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "visual-preview-${GITHUB_RUN_NUMBER}" dist/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "VisuGram Windows preview ${GITHUB_RUN_NUMBER}" \
+            --prerelease --notes-file docs/release-notes.md
