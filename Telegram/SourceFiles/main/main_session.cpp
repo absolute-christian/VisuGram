@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "main/main_session.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "apiwrap.h"
 #include "api/api_peer_colors.h"
 #include "api/api_updates.h"
@@ -289,6 +291,7 @@ Session::Session(
 		data().stickers().notifyUpdated(Data::StickersType::Masks);
 		data().stickers().notifyUpdated(Data::StickersType::Emoji);
 		data().stickers().notifySavedGifsUpdated();
+		Ayu::Visual::RestoreMessages(this);
 		DEBUG_LOG(("Init: Account stored data load finished."));
 	} }).dispatch();
 

@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/components/recent_shared_media_gifts.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_credits.h" // InputSavedStarGiftId
 #include "api/api_premium.h"
 #include "apiwrap.h"
@@ -58,6 +60,12 @@ void RecentSharedMediaGifts::request(
 		not_null<PeerData*> peer,
 		Fn<void(std::vector<SavedStarGift>)> done,
 		bool onlyPinnedToTop) {
+	const auto originalDone = std::move(done);
+	done = [=](std::vector<SavedStarGift> gifts) {
+		auto combined = Ayu::Visual::Gifts(peer, onlyPinnedToTop);
+		combined.insert(end(combined), begin(gifts), end(gifts));
+		originalDone(std::move(combined));
+	};
 	const auto it = _recent.find(peer->id);
 	if (it != _recent.end()) {
 		auto &entry = it->second;
@@ -101,6 +109,15 @@ void RecentSharedMediaGifts::request(
 		}
 
 		done(filterGifts(entry.gifts, onlyPinnedToTop));
+		for (const auto &callback : entry.pendingCallbacks) {
+			callback();
+		}
+		entry.pendingCallbacks.clear();
+	}).fail([=] {
+		auto &entry = _recent[peer->id];
+		entry.requestId = 0;
+		entry.lastRequestTime = 0;
+		done({});
 		for (const auto &callback : entry.pendingCallbacks) {
 			callback();
 		}

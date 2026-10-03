@@ -67,6 +67,11 @@ class GenericBox;
 class Show;
 class VerticalLayout;
 
+[[nodiscard]] object_ptr<RpWidget> MakeVisualGiftPreview(
+	QWidget *parent,
+	not_null<PeerData*> recipient,
+	const Info::PeerGifts::GiftDescriptor &descriptor);
+
 void ChooseStarGiftRecipient(
 	not_null<Window::SessionController*> controller);
 

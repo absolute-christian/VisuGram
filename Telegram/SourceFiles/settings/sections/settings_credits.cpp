@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "settings/sections/settings_credits.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_credits.h"
 #include "api/api_earn.h"
 #include "api/api_statistics.h"
@@ -571,12 +573,16 @@ void Credits::setupContent() {
 				lt_emoji,
 				rpl::single(Ui::MakeCreditsIconEntity()),
 				lt_amount,
-				(isCurrency
-					? controller()->session().credits().tonBalanceValue()
-					: controller()->session().credits().balanceValue()
-				) | rpl::map(
-					Lang::FormatCreditsAmountDecimal
-				) | rpl::map(tr::bold),
+				rpl::combine(
+					isCurrency
+						? controller()->session().credits().tonBalanceValue()
+						: controller()->session().credits().balanceValue(),
+					Ayu::Visual::EnabledValue(&controller()->session())
+				) | rpl::map([=](CreditsAmount amount, bool enabled) {
+					return (!isCurrency && enabled)
+						? u"∞"_q
+						: Lang::FormatCreditsAmountDecimal(amount);
+				}) | rpl::map(tr::bold),
 				tr::marked),
 			textSt,
 			st::defaultPopupMenu,
@@ -937,6 +943,7 @@ void BuildCreditsButtons(
 	const auto controller = builder.controller();
 	const auto self = session->user();
 
+
 	if (!isCurrency) {
 		auto statsShown = session->credits().loadedValue(
 		) | rpl::map([session] {
@@ -992,6 +999,27 @@ void BuildCreditsButtons(
 			*earnButton = earn;
 		}
 	}
+	if (!isCurrency) {
+		const auto toggle = builder.addButton({
+			.id = u"stars/visual"_q,
+			.title = Ayu::Visual::TextValue(u"Visual Stars"_q, u"Визуальные звёзды"_q),
+			.st = &st::settingsCreditsButton,
+			.toggled = Ayu::Visual::EnabledValue(session),
+			.keywords = { u"visual"_q, u"stars"_q },
+		});
+		if (toggle) {
+			toggle->toggledValue() | rpl::filter([=](bool enabled) {
+				return enabled != Ayu::Visual::Enabled(session);
+			}) | rpl::on_next([=](bool enabled) {
+				if (!Ayu::Visual::SetEnabled(session, enabled)) {
+					controller->showToast(Ayu::Visual::Text(
+						u"Could not save visual settings."_q,
+						u"Не удалось сохранить визуальные настройки."_q));
+				}
+			}, toggle->lifetime());
+		}
+	}
+
 }
 
 void BuildCreditsSectionContent(

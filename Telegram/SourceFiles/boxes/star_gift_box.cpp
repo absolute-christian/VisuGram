@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/star_gift_box.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "boxes/star_gift_cover_box.h"
 
 #include "apiwrap.h"
@@ -2312,6 +2314,14 @@ void Controller::rowClicked(not_null<PeerListRow*> row) {
 
 } // namespace
 
+object_ptr<RpWidget> MakeVisualGiftPreview(
+		QWidget *parent,
+		not_null<PeerData*> recipient,
+		const GiftDescriptor &descriptor) {
+	return object_ptr<PreviewWrap>(parent, recipient, rpl::single(
+		GiftSendDetails{ .descriptor = descriptor }));
+}
+
 std::vector<not_null<UserData*>> CollectGiftFrequentUsers(
 		not_null<Main::Session*> session,
 		const std::vector<UserId> &exclude) {
@@ -2367,6 +2377,10 @@ void ChooseStarGiftRecipient(
 void ShowStarGiftBox(
 		not_null<Window::SessionController*> controller,
 		not_null<PeerData*> peer) {
+	if (Ayu::Visual::Enabled(&controller->session())) {
+		Ayu::Visual::ShowCatalog(controller, peer);
+		return;
+	}
 	if (controller->showFrozenError()) {
 		return;
 	}
@@ -4465,6 +4479,10 @@ void DefaultGiftHandler(
 		not_null<Window::SessionController*> window,
 		not_null<DefaultGiftHandlerState*> state,
 		Info::PeerGifts::GiftDescriptor descriptor) {
+	if (Ayu::Visual::Enabled(&window->session())) {
+		Ayu::Visual::ShowCatalog(window, state->peer);
+		return;
+	}
 	const auto star = std::get_if<GiftTypeStars>(&descriptor);
 	const auto send = crl::guard(&state->guard, [=] {
 		window->show(Box(
@@ -5053,6 +5071,11 @@ void SendGiftBox(
 	});
 
 	const auto button = box->addButton(rpl::single(QString()), [=] {
+		if (Ayu::Visual::Enabled(&window->session())) {
+			box->closeBox();
+			Ayu::Visual::ShowCatalog(window, peer);
+			return;
+		}
 		if (state->submitting) {
 			return;
 		}

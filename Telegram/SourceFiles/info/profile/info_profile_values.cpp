@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/profile/info_profile_values.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_chat_participants.h"
 #include "apiwrap.h"
 #include "info/profile/info_profile_phone_menu.h"
@@ -54,10 +56,14 @@ auto PlainAboutValue(not_null<PeerData*> peer) {
 
 auto PlainUsernameValue(not_null<PeerData*> peer) {
 	return rpl::merge(
-		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username),
-		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames)
+		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username) | rpl::to_empty,
+		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames) | rpl::to_empty,
+		Ayu::Visual::Changes(&peer->session())
 	) | rpl::map([=] {
-		return peer->username();
+		const auto names = Ayu::Visual::Usernames(&peer->session());
+		return (peer->isSelf() && !names.empty())
+			? names.front()
+			: peer->username();
 	});
 }
 
@@ -129,9 +135,13 @@ rpl::producer<TextWithEntities> PhoneValue(not_null<UserData*> user) {
 		Countries::Instance().updated(),
 		user->session().changes().peerFlagsValue(
 			user,
-			UpdateFlag::PhoneNumber) | rpl::to_empty
+			UpdateFlag::PhoneNumber) | rpl::to_empty,
+		Ayu::Visual::Changes(&user->session())
 	) | rpl::map([=] {
-		return tr::marked(Ui::FormatPhone(user->phone()));
+		const auto visual = Ayu::Visual::Phone(&user->session());
+		return tr::marked((user->isSelf() && !visual.isEmpty())
+			? visual
+			: Ui::FormatPhone(user->phone()));
 	});
 }
 
@@ -146,9 +156,12 @@ rpl::producer<TextWithEntities> PhoneOrHiddenValue(not_null<UserData*> user) {
 			const QString &username,
 			const QString &about,
 			const QString &hidden) {
-		if (phone.text.isEmpty() && username.isEmpty() && about.isEmpty()) {
+		if (user->isSelf() && !Ayu::Visual::Phone(&user->session()).isEmpty()) {
+			return tr::link(phone, u"internal:visual_phone"_q);
+		} else if (phone.text.isEmpty() && username.isEmpty() && about.isEmpty()) {
 			return tr::marked(hidden);
-		} else if (IsCollectiblePhone(user)) {
+		} else if (IsCollectiblePhone(user)
+			&& (!user->isSelf() || Ayu::Visual::Phone(&user->session()).isEmpty())) {
 			return tr::link(phone, u"internal:collectible_phone/"_q
 				+ user->phone() + '@' + QString::number(user->id.value));
 		} else {
@@ -197,6 +210,10 @@ QString UsernameUrl(
 		not_null<PeerData*> peer,
 		const QString &username,
 		bool link) {
+	if (peer->isSelf()
+		&& Ayu::Visual::Usernames(&peer->session()).contains(username)) {
+		return u"internal:visual_username"_q;
+	}
 	const auto type = !peer->isUsernameEditable(username)
 		? u"collectible_username"_q
 		: link
@@ -220,12 +237,16 @@ rpl::producer<std::vector<TextWithEntities>> UsernamesValue(
 		}) | ranges::to_vector;
 	};
 	auto value = rpl::merge(
-		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username),
-		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames)
+		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username) | rpl::to_empty,
+		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames) | rpl::to_empty,
+		Ayu::Visual::Changes(&peer->session())
 	);
 	if (const auto user = peer->asUser()) {
 		return std::move(value) | rpl::map([=] {
-			return map(user->usernames());
+			const auto names = Ayu::Visual::Usernames(&user->session());
+			return (user->isSelf() && !names.empty())
+				? map(std::vector<QString>(begin(names), end(names)))
+				: map(user->usernames());
 		});
 	} else if (const auto channel = peer->asChannel()) {
 		return std::move(value) | rpl::map([=] {
@@ -656,11 +677,13 @@ rpl::producer<int> SavedSublistCountValue(
 }
 
 rpl::producer<int> PeerGiftsCountValue(not_null<PeerData*> peer) {
-	return peer->session().changes().peerFlagsValue(
-		peer,
-		UpdateFlag::PeerGifts
+	return rpl::merge(
+		peer->session().changes().peerFlagsValue(
+			peer,
+			UpdateFlag::PeerGifts) | rpl::to_empty,
+		Ayu::Visual::Changes(&peer->session())
 	) | rpl::map([=] {
-		return peer->peerGiftsCount();
+		return peer->peerGiftsCount() + int(Ayu::Visual::Gifts(peer).size());
 	});
 }
 

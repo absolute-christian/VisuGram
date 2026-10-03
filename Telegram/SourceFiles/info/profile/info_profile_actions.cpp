@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/profile/info_profile_actions.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_blocked_peers.h"
 #include "api/api_chat_participants.h"
 #include "api/api_credits.h"
@@ -206,6 +208,12 @@ base::options::toggle ShowChannelJoinedBelowAbout({
 		const QString &addToLink) {
 	const auto weak = base::make_weak(controller);
 	return [=](QString link) {
+		if (link == u"internal:visual_username") {
+			if (const auto strong = weak.get()) {
+				Ayu::Visual::ShowProfileEditor(strong, false);
+			}
+			return;
+		}
 		if (link.startsWith(u"internal:"_q)) {
 			Core::App().openInternalUrl(link,
 				QVariant::fromValue(ClickHandlerContext{
@@ -1488,6 +1496,10 @@ Section DetailsFiller::makeInfo() {
 		window = _controller->parentController()](
 			const ClickHandlerPtr &handler,
 			Qt::MouseButton button) {
+		if (handler->url() == u"internal:visual_phone") {
+			Ayu::Visual::ShowProfileEditor(window, true);
+			return false;
+		}
 		const auto context = ClickContext{
 			button,
 			QVariant::fromValue(ClickHandlerContext{

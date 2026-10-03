@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/peer_gifts/info_peer_gifts_widget.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_credits.h"
 #include "api/api_hash.h"
 #include "api/api_premium.h"
@@ -207,6 +209,7 @@ private:
 	void loaded(const MTPpayments_SavedStarGifts &result);
 	void markInCollection(const Data::SavedStarGift &gift);
 	void refreshButtons();
+	void refreshLocalGifts();
 	void validateButtons();
 	[[nodiscard]] std::unique_ptr<GiftButton> createGiftButton();
 	void showGift(int index);
@@ -347,6 +350,12 @@ InnerWidget::InnerWidget(
 , _api(&_peer->session().mtp())
 , _scrollAnimation([=] { updateScrollCallback(); }) {
 	_singleMin = _delegate.buttonSize();
+	Ayu::Visual::Changes(&_peer->session()) | rpl::on_next([=] {
+		refreshLocalGifts();
+		refreshButtons();
+		refreshAbout();
+	}, lifetime());
+	refreshLocalGifts();
 
 	if (peer->canManageGifts()) {
 		subscribeToUpdates();
@@ -723,6 +732,12 @@ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
 			hasUnique = (parsed->info.unique != nullptr);
 		}
 	}
+	refreshLocalGifts();
+	if (!filter.skipsSomething()) {
+		_entries->total = data.vcount().v + ranges::count_if(*_list, [=](const Entry &entry) {
+			return Ayu::Visual::IsLocal(&_peer->session(), entry.gift.manageId);
+		});
+	}
 	if (_entries->allLoaded) {
 		_entries->total = _entries->list.size();
 	}
@@ -732,6 +747,33 @@ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
 	if (hasUnique) {
 		Ui::PreloadUniqueGiftResellPrices(&_peer->session());
 	}
+}
+
+void InnerWidget::refreshLocalGifts() {
+	if (_addingToCollectionId || _descriptor.current().collectionId) {
+		return;
+	}
+	const auto previous = int(_list->size());
+	_list->erase(ranges::remove_if(*_list, [=](const Entry &entry) {
+		return IsClientMsgId(entry.gift.manageId.userMessageId());
+	}), end(*_list));
+	const auto filter = _descriptor.current().filter;
+	for (const auto &gift : Ayu::Visual::Gifts(_peer)) {
+		const auto unique = gift.info.unique != nullptr;
+		if ((unique && filter.skipUnique)
+			|| (!unique && gift.info.upgradable && filter.skipUpgradable)
+			|| (!unique && !gift.info.limitedCount && filter.skipUnlimited)
+			|| (!unique && gift.info.limitedCount && filter.skipLimited)
+			|| (!gift.hidden && filter.skipSaved)
+			|| (gift.hidden && (filter.skipUnsaved || !_peer->isSelf()))) {
+			continue;
+		}
+		_list->insert(begin(*_list), Entry{
+			.gift = gift,
+			.descriptor = DescriptorForGift(_peer, gift),
+		});
+	}
+	_entries->total = std::max(0, _entries->total + int(_list->size()) - previous);
 }
 
 void InnerWidget::markInCollection(const Data::SavedStarGift &gift) {
@@ -1170,6 +1212,10 @@ void InnerWidget::showMenuFor(not_null<GiftButton*> button, QPoint point) {
 		return;
 	}
 
+	if (Ayu::Visual::IsLocal(&_peer->session(), (*_list)[index].gift.manageId)) {
+		Ayu::Visual::ShowLocalGift(_window, (*_list)[index].gift);
+		return;
+	}
 	auto entry = ::Settings::SavedStarGiftEntry(
 		_peer,
 		(*_list)[index].gift);
@@ -1249,6 +1295,10 @@ void InnerWidget::showGift(int index) {
 				!selected,
 				GiftSelectionMode::Check);
 		}
+		return;
+	}
+	if (Ayu::Visual::IsLocal(&_peer->session(), (*_list)[index].gift.manageId)) {
+		Ayu::Visual::ShowLocalGift(_window, (*_list)[index].gift);
 		return;
 	}
 	::Settings::ShowSavedStarGiftBox(
@@ -1935,6 +1985,9 @@ void InnerWidget::mousePressEvent(QMouseEvent *e) {
 	_pressedIndex = index;
 	const auto collectionId = _descriptor.current().collectionId;
 	const auto canDrag = !_addingToCollectionId
+		&& !ranges::any_of(*_list, [=](const Entry &entry) {
+			return Ayu::Visual::IsLocal(&_peer->session(), entry.gift.manageId);
+		})
 		&& _peer->canManageGifts()
 		&& _list->size() > 1
 		&& (collectionId
@@ -2280,7 +2333,10 @@ bool InnerWidget::isDraggedAnimating() const {
 }
 
 void InnerWidget::requestReorder(int fromIndex, int toIndex) {
-	if (fromIndex == toIndex || !_peer->canManageGifts()) {
+	if (fromIndex == toIndex || !_peer->canManageGifts()
+		|| ranges::any_of(*_list, [=](const Entry &entry) {
+			return Ayu::Visual::IsLocal(&_peer->session(), entry.gift.manageId);
+		})) {
 		return;
 	}
 	const auto collectionId = _descriptor.current().collectionId;

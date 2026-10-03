@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/profile/info_profile_top_bar.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_peer_colors.h"
 #include "api/api_peer_photo.h"
 #include "api/api_user_privacy.h"
@@ -495,6 +497,10 @@ TopBar::TopBar(
 	} else {
 		updateVideoUserpic();
 	}
+
+	Ayu::Visual::Changes(&_peer->session()) | rpl::on_next([=] {
+		setupPinnedToTopGifts(controller);
+	}, lifetime());
 
 	rpl::merge(
 		style::PaletteChanged(),
@@ -3422,6 +3428,10 @@ void TopBar::setupNewGifts(
 		entry.button->show();
 
 		entry.button->setClickedCallback([=, giftData = gift, peer = _peer] {
+			if (Ayu::Visual::IsLocal(&peer->session(), giftData.manageId)) {
+				Ayu::Visual::ShowLocalGift(controller, giftData);
+				return;
+			}
 			::Settings::ShowSavedStarGiftBox(controller, peer, giftData);
 		});
 

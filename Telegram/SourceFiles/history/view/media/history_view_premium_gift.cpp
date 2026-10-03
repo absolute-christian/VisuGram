@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/view/media/history_view_premium_gift.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "apiwrap.h"
 #include "api/api_credits.h" // InputSavedStarGiftId
 #include "api/api_premium.h"
@@ -531,6 +533,13 @@ ClickHandlerPtr OpenStarGiftLink(not_null<HistoryItem*> item) {
 		const auto weak = my.sessionWindow;
 		const auto controller = weak.get();
 		if (!controller) {
+			return;
+		}
+		const auto local = Ayu::Visual::FindGift(
+			&controller->session(),
+			Data::SavedStarGiftId::User(itemId.msg));
+		if (local) {
+			Ayu::Visual::ShowLocalGift(controller, *local);
 			return;
 		} else if (data.unique && data.unique->burned) {
 			controller->showToast(tr::lng_gift_burned_message(tr::now));

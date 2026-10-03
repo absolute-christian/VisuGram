@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "settings/sections/settings_information.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "settings/sections/settings_main.h"
 #include "settings/settings_builder.h"
 #include "settings/settings_common_session.h"
@@ -649,7 +651,9 @@ void SetupRows(
 	}
 
 	const auto copyPhone = [=] {
-		QGuiApplication::clipboard()->setText(self->phone());
+		const auto visual = Ayu::Visual::Phone(session);
+		QGuiApplication::clipboard()->setText(
+			visual.isEmpty() ? self->phone() : visual);
 		controller->showToast(tr::lng_text_copied(tr::now), 500);
 	};
 	const auto phoneButton = AddRow(
@@ -707,6 +711,10 @@ void SetupRows(
 			if (controller->showFrozenError()) {
 				return;
 			}
+			if (!Ayu::Visual::Usernames(session).empty()) {
+				Ayu::Visual::ShowProfileEditor(controller->parentController(), false);
+				return;
+			}
 			const auto box = controller->show(
 				Box(UsernamesBox, session->user()));
 			box->boxClosing(
@@ -718,6 +726,7 @@ void SetupRows(
 	if (targets) {
 		targets->username = usernameButton;
 	}
+	Ayu::Visual::AddProfileRows(container, controller->parentController());
 
 	Ui::AddSkip(container);
 	Ui::AddDividerText(container, tr::lng_settings_username_about());

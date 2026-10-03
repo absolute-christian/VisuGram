@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "settings/settings_credits_graphics.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_chat_invite.h"
 #include "api/api_credits.h"
 #include "api/api_earn.h"
@@ -812,9 +814,10 @@ not_null<Ui::RpWidget*> AddBalanceWidget(
 			(state->label.style()->font->height
 				+ state->count.style()->font->height));
 	};
-	std::move(
-		balanceValue
-	) | rpl::on_next([=](CreditsAmount value) {
+	rpl::combine(
+		std::move(balanceValue),
+		Ayu::Visual::EnabledValue(session)
+	) | rpl::on_next([=](CreditsAmount value, bool visual) {
 		auto text = TextWithEntities();
 		auto helper = Ui::Text::CustomEmojiHelper();
 		if (value.ton()) {
@@ -825,7 +828,7 @@ not_null<Ui::RpWidget*> AddBalanceWidget(
 			text.append(
 				helper.paletteDependent(Ui::Earn::IconCreditsEmoji())
 			).append(' ').append(
-				Lang::FormatCreditsAmountToShort(value).string);
+				visual ? u"∞"_q : Lang::FormatCreditsAmountToShort(value).string);
 		}
 		state->count.setMarkedText(
 			st::semiboldTextStyle,
@@ -2859,6 +2862,10 @@ void ShowSavedStarGiftBox(
 		not_null<PeerData*> owner,
 		const Data::SavedStarGift &data,
 		Fn<std::vector<Data::CreditsHistoryEntry>()> pinned) {
+	if (Ayu::Visual::IsLocal(&controller->session(), data.manageId)) {
+		Ayu::Visual::ShowLocalGift(controller, data);
+		return;
+	}
 	controller->show(Box([=](not_null<Ui::GenericBox*> box) {
 		auto entry = SavedStarGiftEntry(owner, data);
 		entry.pinnedSavedGifts = std::move(pinned);
