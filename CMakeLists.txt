@@ -20,7 +20,7 @@ project(Telegram
     LANGUAGES C CXX
     VERSION ${desktop_app_version_cmake}
     DESCRIPTION "VisuGram Desktop"
-    HOMEPAGE_URL "https://ayugram.one"
+    HOMEPAGE_URL "https://github.com/absolute-christian/VisuGram"
 )
 
 if (APPLE)

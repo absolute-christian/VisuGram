@@ -21,7 +21,7 @@
 
 ## Облачная сборка
 
-Actions → Windows visual build → Run workflow, ветка `dev`. GitHub подготовит зависимости, соберёт Windows x64 Debug, сохранит архив и при включённой опции опубликует предварительный релиз. [Подробности](docs/cloud-build.md).
+Actions → Windows visual preview → Run workflow, ветка `dev`. GitHub подготовит зависимости, соберёт Windows x64 Debug, сохранит архив и при включённой опции опубликует предварительный релиз. [Подробности](docs/cloud-build.md).
 
 ## Основа и лицензия
 

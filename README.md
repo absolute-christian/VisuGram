@@ -21,7 +21,7 @@ The first cloud build is being validated. Preview releases are Debug builds; suc
 
 ## Cloud build
 
-Open Actions → Windows visual build → Run workflow on the `dev` branch. The workflow prepares dependencies and builds Windows x64 Debug on GitHub, uploads the portable ZIP and can publish a prerelease. [Cloud build details](docs/cloud-build.md).
+Open Actions → Windows visual preview → Run workflow on the `dev` branch. The workflow prepares dependencies and builds Windows x64 Debug on GitHub, uploads the portable ZIP and can publish a prerelease. [Cloud build details](docs/cloud-build.md).
 
 ## Upstream and license
 

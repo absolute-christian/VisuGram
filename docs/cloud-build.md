@@ -10,4 +10,4 @@ Workflow «Windows visual preview» компилирует приложение 
 
 Распакуйте ZIP целиком в отдельную доступную для записи папку и запустите VisuGram.exe. Сохраните рядом TelegramForcePortable: в ней клиент хранит данные входа и визуальные настройки. Предварительная сборка не подписана. Успешная компиляция подтверждает сборку исходников, но ручная проверка входа, подарков, анимаций и сохранения настроек проводится отдельно.
 
-Источники конфигурации: [AyuGram Windows development](https://docs.ayugram.one/desktop/development/windows/), [Windows runner image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md), штатные Telegram/build/prepare/prepare.py и Telegram/build/qt_version.py.
+Источники конфигурации: [AyuGram Windows development](https://github.com/AyuGram/AyuGramDesktop/blob/dev/docs/building-win.md), [Windows runner image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md), штатные Telegram/build/prepare/prepare.py и Telegram/build/qt_version.py.
