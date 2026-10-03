@@ -45,7 +45,10 @@ jobs:
           path: |
             TBuild/Libraries/win64
             TBuild/ThirdParty
-          key: win2022-v143-14.44-sdk26100-qt5-debug-v1-${{ hashFiles('TBuild/tdesktop/Telegram/build/prepare/prepare.py', 'TBuild/tdesktop/Telegram/build/qt_version.py', 'TBuild/tdesktop/.github/scripts/cloud-build.ps1') }}
+          key: win2022-v143-14.44-sdk26100-qt5-debug-v1-${{ hashFiles('TBuild/tdesktop/Telegram/build/prepare/prepare.py', 'TBuild/tdesktop/Telegram/build/qt_version.py', 'TBuild/tdesktop/.github/scripts/cloud-build.ps1') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            win2022-v143-14.44-sdk26100-qt5-debug-v1-${{ hashFiles('TBuild/tdesktop/Telegram/build/prepare/prepare.py', 'TBuild/tdesktop/Telegram/build/qt_version.py', 'TBuild/tdesktop/.github/scripts/cloud-build.ps1') }}-
+            win2022-v143-14.44-sdk26100-qt5-debug-v1-
       - name: Prepare build tools
         run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 bootstrap
       - name: Compile dependencies
