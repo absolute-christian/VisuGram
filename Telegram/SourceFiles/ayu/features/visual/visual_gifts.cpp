@@ -33,6 +33,8 @@ constexpr auto kMaxFileSize = 16 * 1024 * 1024;
 constexpr auto kMaxGifts = 1000;
 constexpr auto kMaxPinned = 6;
 constexpr auto kResourceRetryDelay = crl::time(60 * 1000);
+constexpr auto kSyncInterval = crl::time(5 * 1000);
+constexpr auto kBackgroundSyncInterval = crl::time(60 * 1000);
 
 struct Record {
 	MTPStarGift source;
@@ -70,7 +72,9 @@ public:
 	void sync();
 	void view(not_null<PeerData*> peer);
 	void acceptGift(QJsonObject object, bool newlySent = false);
-	void applyServerGifts();
+	void applyServerGifts(
+		const QJsonArray &knownGifts = QJsonArray(),
+		bool notifyNew = false);
 	[[nodiscard]] QJsonObject profile(not_null<PeerData*> peer);
 
 	const not_null<Main::Session*> session;
@@ -186,7 +190,8 @@ State::State(not_null<Main::Session*> session)
 			view(this->session->data().peer(watchedPeer));
 		}
 	});
-	syncTimer.start(60 * 1000);
+	syncTimer.start(int(enabled.current()
+		? kSyncInterval : kBackgroundSyncInterval));
 	QTimer::singleShot(0, &network, [this] { sync(); });
 }
 
@@ -633,7 +638,7 @@ void State::sync() {
 		}
 		pendingServerGifts = serverGifts;
 		if (enabled.current()) {
-			applyServerGifts();
+			applyServerGifts(previousGifts, !previousCursor.isEmpty());
 			restoredPeers.clear();
 			restoreMessages();
 		}
@@ -850,13 +855,26 @@ void State::acceptMutation(QJsonObject object, bool newlySent) {
 	sync();
 }
 
-void State::applyServerGifts() {
+void State::applyServerGifts(const QJsonArray &knownGifts, bool notifyNew) {
 	if (!enabled.current()) {
 		return;
 	}
+	auto known = base::flat_set<QString>();
+	if (notifyNew) {
+		for (const auto &value : knownGifts) {
+			known.emplace(value.toObject().value(u"id"_q).toString());
+		}
+	}
+	const auto self = QString::number(peerToUser(session->userPeerId()).bare);
 	const auto gifts = std::exchange(pendingServerGifts, QJsonArray());
 	for (const auto &value : gifts) {
-		acceptGift(value.toObject());
+		const auto object = value.toObject();
+		const auto received = notifyNew
+			&& !known.contains(object.value(u"id"_q).toString())
+			&& object.value(u"recipient_id"_q).toString() == self
+			&& object.value(u"sender_id"_q).toString() != self
+			&& object.value(u"active"_q).toBool(true);
+		acceptGift(object, received);
 	}
 }
 
@@ -1019,6 +1037,7 @@ bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 		state.enabled = previous;
 		return false;
 	}
+	state.syncTimer.start(int(enabled ? kSyncInterval : kBackgroundSyncInterval));
 	if (enabled) {
 		state.restoreMessages();
 	} else {
@@ -1037,6 +1056,9 @@ bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 		}
 	}
 	state.notify();
+	if (enabled) {
+		state.sync();
+	}
 	return true;
 }
 
