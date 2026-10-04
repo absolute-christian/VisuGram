@@ -4654,6 +4654,8 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		rpl::variable<VisibleRange> visibleRange;
 		bool sending = false;
 		int perRow = 1;
+		int firstVisible = -1;
+		int lastVisible = -1;
 	};
 	const auto buttonMode = (mode == GiftsListMode::Craft)
 		? GiftButtonMode::Craft
@@ -4711,8 +4713,17 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		const auto rowTill = (std::max(rangeTill, 0) + singleh - 1)
 			/ singleh;
 		Assert(rowTill >= rowFrom);
-		const auto first = rowFrom * perRow;
+		const auto first = std::min(rowFrom * perRow, count);
 		const auto last = std::min(rowTill * perRow, count);
+		if (state->firstVisible == first && state->lastVisible == last) {
+			const auto page = range.bottom - range.top;
+			if (loadMore && page > 0 && range.bottom + page > raw->height()) {
+				loadMore();
+			}
+			return;
+		}
+		state->firstVisible = first;
+		state->lastVisible = last;
 		auto checkedFrom = 0;
 		auto checkedTill = int(buttons.size());
 		const auto ensureButton = [&](int index) {
@@ -4756,6 +4767,7 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 					anim::type::instant);
 				raw->setAttribute(Qt::WA_TransparentForMouseEvents, already);
 			}
+			raw->setLightweightAnimations(Ayu::Visual::Enabled(session));
 			raw->setDescriptor(descriptor, buttonMode);
 			raw->setClickedCallback([=] {
 				handler(descriptor);
@@ -4814,6 +4826,8 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 			| ranges::views::take(count)
 			| ranges::to_vector;
 		state->validated.clear();
+		state->firstVisible = -1;
+		state->lastVisible = -1;
 
 		if (SortForBirthday(peer)) {
 			ranges::stable_partition(state->order, [&](int i) {

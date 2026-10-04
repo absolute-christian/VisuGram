@@ -208,9 +208,9 @@ base::options::toggle ShowChannelJoinedBelowAbout({
 		const QString &addToLink) {
 	const auto weak = base::make_weak(controller);
 	return [=](QString link) {
-		if (link == u"internal:visual_username") {
+		if (link.startsWith(u"internal:visual_username/")) {
 			if (const auto strong = weak.get()) {
-				Ayu::Visual::ShowProfileEditor(strong, false);
+				Ayu::Visual::ShowCollectible(strong, peer, link.mid(25));
 			}
 			return;
 		}
@@ -1497,7 +1497,7 @@ Section DetailsFiller::makeInfo() {
 			const ClickHandlerPtr &handler,
 			Qt::MouseButton button) {
 		if (handler->url() == u"internal:visual_phone") {
-			Ayu::Visual::ShowProfileEditor(window, true);
+			Ayu::Visual::ShowCollectible(window, peer, Ayu::Visual::PhoneFor(peer));
 			return false;
 		}
 		const auto context = ClickContext{

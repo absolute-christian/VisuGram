@@ -60,8 +60,8 @@ auto PlainUsernameValue(not_null<PeerData*> peer) {
 		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames) | rpl::to_empty,
 		Ayu::Visual::Changes(&peer->session())
 	) | rpl::map([=] {
-		const auto names = Ayu::Visual::Usernames(&peer->session());
-		return (peer->isSelf() && !names.empty())
+		const auto names = Ayu::Visual::DisplayUsernames(peer);
+		return (!names.empty())
 			? names.front()
 			: peer->username();
 	});
@@ -138,8 +138,8 @@ rpl::producer<TextWithEntities> PhoneValue(not_null<UserData*> user) {
 			UpdateFlag::PhoneNumber) | rpl::to_empty,
 		Ayu::Visual::Changes(&user->session())
 	) | rpl::map([=] {
-		const auto visual = Ayu::Visual::Phone(&user->session());
-		return tr::marked((user->isSelf() && !visual.isEmpty())
+		const auto visual = Ayu::Visual::PhoneFor(user);
+		return tr::marked((!visual.isEmpty())
 			? visual
 			: Ui::FormatPhone(user->phone()));
 	});
@@ -156,12 +156,12 @@ rpl::producer<TextWithEntities> PhoneOrHiddenValue(not_null<UserData*> user) {
 			const QString &username,
 			const QString &about,
 			const QString &hidden) {
-		if (user->isSelf() && !Ayu::Visual::Phone(&user->session()).isEmpty()) {
+		if (!Ayu::Visual::PhoneFor(user).isEmpty()) {
 			return tr::link(phone, u"internal:visual_phone"_q);
 		} else if (phone.text.isEmpty() && username.isEmpty() && about.isEmpty()) {
 			return tr::marked(hidden);
 		} else if (IsCollectiblePhone(user)
-			&& (!user->isSelf() || Ayu::Visual::Phone(&user->session()).isEmpty())) {
+			&& (!user->isSelf() || Ayu::Visual::PhoneFor(user).isEmpty())) {
 			return tr::link(phone, u"internal:collectible_phone/"_q
 				+ user->phone() + '@' + QString::number(user->id.value));
 		} else {
@@ -210,9 +210,8 @@ QString UsernameUrl(
 		not_null<PeerData*> peer,
 		const QString &username,
 		bool link) {
-	if (peer->isSelf()
-		&& Ayu::Visual::Usernames(&peer->session()).contains(username)) {
-		return u"internal:visual_username"_q;
+	if (Ayu::Visual::IsVisualUsername(peer, username)) {
+		return u"internal:visual_username/"_q + username;
 	}
 	const auto type = !peer->isUsernameEditable(username)
 		? u"collectible_username"_q
@@ -243,10 +242,8 @@ rpl::producer<std::vector<TextWithEntities>> UsernamesValue(
 	);
 	if (const auto user = peer->asUser()) {
 		return std::move(value) | rpl::map([=] {
-			const auto names = Ayu::Visual::Usernames(&user->session());
-			return (user->isSelf() && !names.empty())
-				? map(std::vector<QString>(names.cbegin(), names.cend()))
-				: map(user->usernames());
+			const auto names = Ayu::Visual::DisplayUsernames(user);
+			return map(std::vector<QString>(names.cbegin(), names.cend()));
 		});
 	} else if (const auto channel = peer->asChannel()) {
 		return std::move(value) | rpl::map([=] {
@@ -683,7 +680,7 @@ rpl::producer<int> PeerGiftsCountValue(not_null<PeerData*> peer) {
 			UpdateFlag::PeerGifts) | rpl::to_empty,
 		Ayu::Visual::Changes(&peer->session())
 	) | rpl::map([=] {
-		return peer->peerGiftsCount() + int(Ayu::Visual::Gifts(peer).size());
+		return peer->peerGiftsCount() + Ayu::Visual::GiftCount(peer);
 	});
 }
 

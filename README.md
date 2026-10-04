@@ -2,9 +2,9 @@
 
 [Русский](README-RU.md) · [Download](https://github.com/absolute-christian/VisuGram/releases)
 
-A fork of [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop) with local visual gifts, phone numbers and collectible usernames.
+A fork of [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop) with visual gifts, collectible phone numbers and usernames.
 
-Visual changes are visible only in this client. They do not change your Telegram account, real Stars balance or NFT ownership.
+Visual changes are local by default. An optional shared server synchronizes them between VisuGram users. They do not change your Telegram account, real Stars balance or NFT ownership.
 
 ## Features
 
@@ -12,7 +12,8 @@ Visual changes are visible only in this client. They do not change your Telegram
 - Public gift catalog with collectible models, patterns and backdrops.
 - Local gifting, including gifts to yourself in Saved Messages.
 - Profile gift collection with hiding, deletion and up to six pinned collectibles.
-- Editable visual phone number and multiple NFT usernames.
+- Existing +888 collectible numbers and secondary NFT usernames with purchase information.
+- Shared visual profiles and gifts through a configurable sync server.
 - English and Russian labels for the added controls.
 
 ## Installation
@@ -27,7 +28,7 @@ The current release is an experimental Debug preview; runtime behavior has not y
 
 ## Documentation
 
-[Visual mode](docs/visual-mode.md) · [Cloud builds](docs/cloud-build.md)
+[Visual mode](docs/visual-mode.md) · [Cloud builds](docs/cloud-build.md) · [Sync server](server/README.md)
 
 ## Credits
 

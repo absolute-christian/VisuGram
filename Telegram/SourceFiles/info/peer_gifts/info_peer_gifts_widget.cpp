@@ -798,6 +798,7 @@ void InnerWidget::refreshButtons() {
 
 std::unique_ptr<GiftButton> InnerWidget::createGiftButton() {
 	auto button = std::make_unique<GiftButton>(this, &_delegate);
+	button->setLightweightAnimations(Ayu::Visual::Enabled(&_peer->session()));
 	const auto raw = button.get();
 	raw->contextMenuRequests(
 	) | rpl::on_next([=](QPoint point) {

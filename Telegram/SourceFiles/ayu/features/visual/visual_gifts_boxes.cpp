@@ -1,6 +1,7 @@
 #include "ayu/features/visual/visual_gifts.h"
 
 #include "api/api_premium.h"
+#include "base/unixtime.h"
 #include "boxes/star_gift_box.h"
 #include "boxes/star_gift_cover_box.h"
 #include "chat_helpers/compose/compose_show.h"
@@ -15,6 +16,8 @@
 #include "mtproto/sender.h"
 #include "settings/settings_common.h"
 #include "ui/boxes/boost_box.h"
+#include "ui/boxes/collectible_info_box.h"
+#include "ui/dynamic_thumbnails.h"
 #include "ui/layers/generic_box.h"
 #include "ui/text/format_values.h"
 #include "ui/vertical_list.h"
@@ -30,6 +33,7 @@
 
 #include <QtCore/QRegularExpression>
 #include <QtCore/QUrl>
+#include <QtCore/QUuid>
 
 namespace Ayu::Visual {
 namespace {
@@ -81,8 +85,8 @@ void ShowSendBox(
 		box->setTitle(TextValue(u"Visual gift"_q, u"Визуальный подарок"_q));
 		AddCover(box, recipient, *gift);
 		AddLabel(box, Text(
-			u"For "_q + recipient->name() + u" · visible only in this client"_q,
-			u"Для "_q + recipient->name() + u" · виден только в этом клиенте"_q));
+			u"Visual gift for "_q + recipient->name(),
+			u"Визуальный подарок для "_q + recipient->name()));
 		const auto message = box->addRow(object_ptr<Ui::InputField>(
 			box,
 			st::giftBoxTextField,
@@ -94,43 +98,46 @@ void ShowSendBox(
 			tr::lng_gift_send_anonymous(tr::now),
 			false,
 			st::defaultCheckbox), st::boxRowPadding);
+		auto price = gift->unique
+			? (forceTon
+				? Data::UniqueGiftResaleTon(*gift->unique)
+				: Data::UniqueGiftResaleAsked(*gift->unique))
+			: CreditsAmount(gift->stars);
+		if (price.value() < 0) {
+			price = CreditsAmount();
+		}
+		const auto sending = box->lifetime().make_state<bool>(false);
+		const auto operation = box->lifetime().make_state<QString>();
+		const auto lastInput = box->lifetime().make_state<QString>();
 		box->addButton(tr::lng_gift_send_button(
 			lt_cost,
-			rpl::single([&] {
-				auto price = gift->unique
-					? (forceTon
-						? Data::UniqueGiftResaleTon(*gift->unique)
-						: Data::UniqueGiftResaleAsked(*gift->unique))
-					: CreditsAmount(gift->stars);
-				if (price.value() < 0) {
-					price = CreditsAmount();
-				}
-				return (price.ton() ? u"TON "_q : u"★ "_q)
-					+ Lang::FormatCreditsAmountDecimal(price);
-			}())), [=] {
-			if (!Enabled(&window->session())) {
-				box->closeBox();
+			rpl::single((price.ton() ? u"TON "_q : u"★ "_q)
+				+ Lang::FormatCreditsAmountDecimal(price))), [=] {
+			if (*sending || !Enabled(&window->session())) {
 				return;
 			}
-			const auto saved = AddGift(
-				recipient,
-				source,
-				message->getLastText(),
-				anonymous->checked());
-			if (!saved) {
-				StorageError(window);
-				return;
+			const auto text = message->getLastText();
+			const auto fingerprint = text + (anonymous->checked() ? '1' : '0');
+			if (operation->isEmpty() || *lastInput != fingerprint) {
+				*operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
+				*lastInput = fingerprint;
 			}
-			box->closeBox();
-			window->hideLayer();
-			window->showPeerHistory(
-				recipient,
-				Window::SectionShow::Way::ClearStack,
-				ShowAtTheEndMsgId);
-			window->showToast(Text(
-				u"Visual gift sent"_q,
-				u"Визуальный подарок отправлен"_q));
-			Ui::StartFireworks(window->widget());
+			*sending = true;
+			SendGift(recipient, source, text, anonymous->checked(), price, *operation,
+				crl::guard(box, [=](std::optional<Data::SavedStarGift> saved, QString error) {
+					*sending = false;
+					if (!saved) {
+						window->showToast(SyncError(error));
+						return;
+					}
+					box->closeBox();
+					window->hideLayer();
+					window->showPeerHistory(recipient,
+						Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
+					window->showToast(Text(u"Visual gift sent"_q,
+						u"Визуальный подарок отправлен"_q));
+					Ui::StartFireworks(window->widget());
+				}));
 		});
 		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 	}));
@@ -202,47 +209,87 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 			editPhone ? u"Visual phone number"_q : u"Visual NFT usernames"_q,
 			editPhone ? u"Визуальный номер телефона"_q : u"Визуальные NFT-юзернеймы"_q));
 		AddLabel(box, Text(
-			u"Visible only in this client. Leave empty to use your real profile."_q,
-			u"Видно только в этом клиенте. Оставьте пустым для настоящих данных профиля."_q));
-		if (!editPhone) {
-			AddLabel(box, Text(
-				u"One username per line. The first is primary; reorder lines to change it."_q,
-				u"Один юзернейм на строку. Первый — основной; порядок можно менять."_q));
+			editPhone ? u"Only existing collectible +888 numbers are supported."_q
+				: u"One username per line. Put a collectible first to display it as primary. Your Telegram usernames remain available."_q,
+			editPhone ? u"Поддерживаются только существующие коллекционные номера +888."_q
+				: u"Один юзернейм на строку. Поставьте коллекционный первым, чтобы сделать его основным. Настоящие юзернеймы Telegram сохранятся."_q));
+		auto initialNames = DisplayUsernames(session->user());
+		for (const auto &name : Usernames(session)) {
+			if (!initialNames.contains(name, Qt::CaseInsensitive)) {
+				initialNames.push_back(name);
+			}
 		}
 		const auto field = box->addRow(object_ptr<Ui::InputField>(
-			box,
-			st::defaultInputField,
+			box, st::defaultInputField,
 			editPhone ? Ui::InputField::Mode::SingleLine : Ui::InputField::Mode::MultiLine,
 			rpl::single(editPhone ? u"+888 …"_q : u"@username"_q),
-			editPhone ? Phone(session) : Usernames(session).join('\n')),
-			st::boxRowPadding);
-		field->setMaxLength(editPhone ? 64 : 1024);
+			editPhone ? (Phone(session).isEmpty() ? u"+888"_q : Phone(session))
+				: initialNames.join('\n')), st::boxRowPadding);
+		field->setMaxLength(editPhone ? 32 : 1024);
+		const auto saving = box->lifetime().make_state<bool>(false);
 		box->addButton(tr::lng_settings_save(), [=] {
+			if (*saving) {
+				return;
+			}
 			const auto text = field->getLastText().trimmed();
-			auto names = QStringList();
-			if (!editPhone) {
-				const auto pattern = QRegularExpression(u"^[A-Za-z][A-Za-z0-9_]{3,31}$"_q);
+			auto phone = Phone(session);
+			auto names = Usernames(session);
+			auto primary = IsVisualUsername(session->user(), initialNames.value(0))
+				? initialNames.value(0) : QString();
+			if (editPhone) {
+				if (!QRegularExpression(u"^[+0-9 ()-]*$"_q).match(text).hasMatch()) {
+					field->showError();
+					return;
+				}
+				phone = text;
+				phone.remove(QRegularExpression(u"[^0-9]"_q));
+				if (phone == u"888" || phone.isEmpty()) {
+					phone.clear();
+				} else {
+					if (phone.size() == 8) {
+						phone.prepend(u"888"_q);
+					}
+					if (!QRegularExpression(u"^888[0-9]{8}$"_q).match(phone).hasMatch()) {
+						field->showError();
+						return;
+					}
+					phone.prepend('+');
+				}
+			} else {
+				names.clear();
+				primary.clear();
+				auto seen = QStringList();
+				const auto pattern = QRegularExpression(u"^[a-z][a-z0-9_]{3,31}$"_q);
 				for (auto name : text.split('\n', Qt::SkipEmptyParts)) {
-					name = name.trimmed();
+					name = name.trimmed().toLower();
 					if (name.startsWith('@')) {
 						name.remove(0, 1);
 					}
 					if (!pattern.match(name).hasMatch()
-						|| names.contains(name, Qt::CaseInsensitive)
-						|| names.size() >= 20) {
+						|| seen.contains(name) || seen.size() >= 20) {
 						field->showError();
 						return;
 					}
-					names.push_back(name);
+					const auto native = ranges::any_of(session->user()->usernames(),
+						[&](const QString &value) { return value.compare(name, Qt::CaseInsensitive) == 0; });
+					if (!native && name != session->user()->editableUsername().toLower()) {
+						if (seen.isEmpty()) {
+							primary = name;
+						}
+						names.push_back(name);
+					}
+					seen.push_back(name);
 				}
 			}
-			if (!SetProfile(session,
-				editPhone ? text : Phone(session),
-				editPhone ? Usernames(session) : names)) {
-				StorageError(window);
-				return;
-			}
-			box->closeBox();
+			*saving = true;
+			SaveProfile(session, phone, names, primary, crl::guard(box, [=](QString error) {
+				*saving = false;
+				if (!error.isEmpty()) {
+					window->showToast(SyncError(error));
+					return;
+				}
+				box->closeBox();
+			}));
 		});
 		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 	}));
@@ -345,44 +392,127 @@ void ShowLocalGift(
 		}
 		const auto session = &window->session();
 		const auto id = gift.manageId;
-		if (gift.mine && gift.info.unique) {
-			box->addButton(TextValue(
-				gift.pinned ? u"Unpin from profile"_q : u"Pin to profile"_q,
-				gift.pinned ? u"Открепить от профиля"_q : u"Закрепить в профиле"_q), [=] {
-				if (!SetPinned(session, id, !gift.pinned)) {
-					window->showToast(Text(
-						u"Could not pin gift. Up to six gifts can be pinned."_q,
-						u"Не удалось закрепить подарок. Можно закрепить до шести подарков."_q));
+		const auto managing = box->lifetime().make_state<bool>(false);
+		const auto manage = [=](bool pinned, bool hidden) {
+			if (*managing) {
+				return;
+			}
+			*managing = true;
+			ManageGift(session, id, pinned, hidden, crl::guard(box, [=](QString error) {
+				*managing = false;
+				if (!error.isEmpty()) {
+					window->showToast(SyncError(error));
 					return;
 				}
 				box->closeBox();
+			}));
+		};
+		if (gift.mine && gift.info.unique
+			&& (SyncServer(session).isEmpty() || IsSyncedGift(session, id))) {
+			box->addButton(TextValue(
+				gift.pinned ? u"Unpin from profile"_q : u"Pin to profile"_q,
+				gift.pinned ? u"Открепить от профиля"_q : u"Закрепить в профиле"_q), [=] {
+				manage(!gift.pinned, gift.pinned && gift.hidden);
 			});
 		}
-		if (gift.mine) {
+		if (gift.mine && (SyncServer(session).isEmpty() || IsSyncedGift(session, id))) {
 			box->addButton(TextValue(
 				gift.hidden ? u"Show on profile"_q : u"Hide from profile"_q,
 				gift.hidden ? u"Показать в профиле"_q : u"Скрыть из профиля"_q), [=] {
-				if (!SetHidden(session, id, !gift.hidden)) {
+				manage(gift.hidden && gift.pinned, !gift.hidden);
+			});
+		}
+		if (!IsSyncedGift(session, id)) {
+			box->addButton(TextValue(u"Delete visual gift"_q,
+				u"Удалить визуальный подарок"_q), [=] {
+				if (!RemoveGift(session, id)) {
 					StorageError(window);
 					return;
 				}
 				box->closeBox();
 			});
 		}
-		box->addButton(TextValue(u"Delete visual gift"_q, u"Удалить визуальный подарок"_q), [=] {
-			if (!RemoveGift(session, id)) {
-				StorageError(window);
+		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+	}));
+}
+
+void ShowCollectible(
+		not_null<Window::SessionController*> window,
+		not_null<PeerData*> peer,
+		QString entity) {
+	const auto metadata = CollectibleMetadata(peer, entity);
+	if (metadata.isEmpty()) {
+		window->showToast(SyncError(u"SERVER_REQUIRED"_q));
+		return;
+	}
+	const auto amount = metadata.value(u"crypto_amount"_q).toString().toULongLong();
+	const auto price = Lang::FormatCreditsAmountDecimal(CreditsAmount(
+		amount / 1'000'000'000, amount % 1'000'000'000, CreditsType::Ton)) + u" TON"_q;
+	const auto date = metadata.value(u"date"_q).toInt();
+	const auto formattedDate = langDateTime(base::unixtime::parse(date));
+	const auto kind = metadata.value(u"price_kind"_q).toString();
+	const auto description = kind == u"visual"
+		? Text(u"Visual purchase on %1 for %2."_q,
+			u"Визуальная покупка %1 за %2."_q).arg(formattedDate, price)
+		: kind == u"last_sale"
+		? Text(u"Last sale on Fragment: %1, %2."_q,
+			u"Последняя продажа на Fragment: %1, %2."_q).arg(price, formattedDate)
+		: kind == u"asking"
+		? Text(u"For sale on Fragment for %1."_q,
+			u"Выставлен на Fragment за %1."_q).arg(price)
+		: kind == u"bid"
+		? Text(u"Current auction bid on Fragment: %1."_q,
+			u"Текущая ставка на Fragment: %1."_q).arg(price)
+		: Text(u"Minimum bid on Fragment: %1."_q,
+			u"Минимальная ставка на Fragment: %1."_q).arg(price);
+	window->show(Box(Ui::CollectibleInfoBox, Ui::CollectibleInfo{
+		.entity = entity,
+		.copyText = entity.startsWith('+') ? entity
+			: peer->session().createInternalLinkFull(entity),
+		.ownerUserpic = Ui::MakeUserpicThumbnail(peer, true),
+		.ownerName = peer->name(),
+		.cryptoAmount = amount,
+		.amount = uint64(metadata.value(u"fiat_amount"_q).toDouble()),
+		.cryptoCurrency = u"TON"_q,
+		.currency = metadata.value(u"fiat_currency"_q).toString(),
+		.url = metadata.value(u"url"_q).toString(),
+		.date = date,
+		.priceDescription = description,
+	}));
+}
+
+void ShowSyncSettings(not_null<Window::SessionController*> window) {
+	window->show(Box([=](not_null<Ui::GenericBox*> box) {
+		const auto session = &window->session();
+		box->setTitle(TextValue(u"Visual sync server"_q, u"Сервер синхронизации"_q));
+		box->setWidth(st::boxWideWidth);
+		AddLabel(box, Text(
+			u"Synchronizes your Telegram ID, basic username, visual profile and gifts with this server. Visual profiles are visible to other users connected to it. Leave empty to disconnect."_q,
+			u"Передаёт этому серверу Telegram ID, настоящий юзернейм, визуальный профиль и подарки. Профиль виден другим подключённым пользователям. Оставьте поле пустым для отключения."_q));
+		const auto field = box->addRow(object_ptr<Ui::InputField>(
+			box, st::defaultInputField, Ui::InputField::Mode::SingleLine,
+			rpl::single(u"https://…"_q), SyncServer(session)), st::boxRowPadding);
+		field->setMaxLength(512);
+		box->addButton(tr::lng_settings_save(), [=] {
+			if (!SetSyncServer(session, field->getLastText())) {
+				field->showError();
+				window->showToast(Text(u"Enter a valid HTTPS server address."_q,
+					u"Введите корректный HTTPS-адрес сервера."_q));
 				return;
 			}
 			box->closeBox();
 		});
-		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 	}));
 }
 
 void AddProfileRows(
 		not_null<Ui::VerticalLayout*> container,
 		not_null<Window::SessionController*> window) {
+	Settings::AddButtonWithIcon(container, TextValue(
+		u"Visual sync server"_q, u"Сервер синхронизации"_q), st::settingsButton)->setClickedCallback([=] {
+		ShowSyncSettings(window);
+	});
 	Settings::AddButtonWithIcon(container, TextValue(
 		u"Visual phone number"_q,
 		u"Визуальный номер телефона"_q), st::settingsButton)->setClickedCallback([=] {

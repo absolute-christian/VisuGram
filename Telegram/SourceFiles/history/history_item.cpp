@@ -7250,6 +7250,26 @@ void HistoryItem::setServiceMessageByAction(const MTPmessageAction &action) {
 							tr::marked);
 			}
 		}
+		if (isLocal() && resale && action.vgift().type() == mtpc_starGiftUnique) {
+			const auto &unique = action.vgift().c_starGiftUnique();
+			const auto name = qs(unique.vtitle()) + u" #"_q
+				+ Lang::FormatCountDecimal(unique.vnum().v);
+			const auto cost = PrepareCreditsAmountText(resale);
+			result.links.clear();
+			result.text = tr::marked(isSelf
+				? (_history->peer->isSelf()
+					? Ayu::Visual::Text(u"You bought %1 for %2"_q,
+						u"Вы купили %1 за %2"_q).arg(name, cost)
+					: Ayu::Visual::Text(u"You sent %1 to %2 for %3"_q,
+						u"Вы подарили %1 пользователю %2 за %3"_q).arg(
+						name, _history->peer->shortName(), cost))
+				: (action.vfrom_id()
+					? Ayu::Visual::Text(u"%1 gifted you %2 for %3"_q,
+						u"%1 подарил(а) вам %2 за %3"_q).arg(
+						from->shortName(), name, cost)
+					: Ayu::Visual::Text(u"You received %1 for %2"_q,
+						u"Вам подарили %1 за %2"_q).arg(name, cost)));
+		}
 		return result;
 	};
 
@@ -7970,6 +7990,9 @@ void HistoryItem::processAction(const MTPMessageAction &action) {
 			fields.count = gift->stars;
 			fields.unique = std::move(gift->unique);
 			if (const auto unique = fields.unique.get()) {
+				if (isLocal()) {
+					fields.message = unique->originalDetails.message;
+				}
 				unique->starsForTransfer
 					= data.vtransfer_stars().value_or(-1);
 				unique->exportAt = data.vcan_export_at().value_or_empty();

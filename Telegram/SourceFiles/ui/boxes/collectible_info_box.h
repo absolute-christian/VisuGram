@@ -30,6 +30,7 @@ struct CollectibleInfo {
 	QString currency;
 	QString url;
 	TimeId date = 0;
+	QString priceDescription;
 };
 
 void CollectibleInfoBox(not_null<Ui::GenericBox*> box, CollectibleInfo info);

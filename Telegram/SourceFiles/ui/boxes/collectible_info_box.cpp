@@ -63,6 +63,9 @@ namespace {
 		: TextWithEntities{ ('{'
 			+ info.cryptoCurrency + ':' + QString::number(info.cryptoAmount)
 			+ '}') };
+	if (info.currency.isEmpty() || !info.amount) {
+		return Ui::Text::Wrapped(price, EntityType::Bold);
+	}
 	const auto fiat = Ui::FillAmountAndCurrency(info.amount, info.currency);
 	return Ui::Text::Wrapped(
 		price,
@@ -218,7 +221,9 @@ void CollectibleInfoBox(
 
 	box->addRow(MakeOwnerCell(box, info), st::collectibleOwnerPadding);
 
-	const auto text = ((type == CollectibleType::Phone)
+	const auto text = !info.priceDescription.isEmpty()
+		? TextWithEntities{ info.priceDescription }
+		: ((type == CollectibleType::Phone)
 		? tr::lng_collectible_phone_info
 		: tr::lng_collectible_username_info)(
 			tr::now,

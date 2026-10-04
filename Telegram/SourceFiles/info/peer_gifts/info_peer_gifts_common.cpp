@@ -184,7 +184,17 @@ GiftButton::~GiftButton() {
 	unsubscribe();
 }
 
+void GiftButton::setLightweightAnimations(bool enabled) {
+	_lightweightAnimations = enabled;
+	if (enabled) {
+		_stars.reset();
+	}
+}
+
 void GiftButton::onStateChanged(State was, StateChangeSource source) {
+	if ((state() ^ was) & State::Enum::Over) {
+		update();
+	}
 	if (_check) {
 		const auto diff = state() ^ was;
 		if (diff & State::Enum::Over) {
@@ -329,6 +339,9 @@ void GiftButton::setDescriptor(const GiftDescriptor &descriptor, Mode mode) {
 		_lockedUntilDate = data.resale ? 0 : data.info.lockedUntilDate;
 	});
 
+	if (_lightweightAnimations) {
+		_stars.reset();
+	}
 	refreshLocked();
 
 	_resolvedDocument = nullptr;
@@ -853,7 +866,7 @@ void GiftButton::paint(QPainter &p, float64 craftProgress) {
 			paused);
 		frame = info.image;
 		_playerFinished = (info.index + 1 == _player->framesCount());
-		if (!_playerFinished || !paused) {
+		if (!paused || (!_lightweightAnimations && !_playerFinished)) {
 			_player->markFrameShown();
 		}
 		const auto size = frame.size() / style::DevicePixelRatio();
@@ -1099,7 +1112,7 @@ void GiftButton::paint(QPainter &p, float64 craftProgress) {
 		if (!premium || onsale) {
 			p.setOpacity(1.);
 		}
-		if (_stars) {
+		if (_stars && !_lightweightAnimations) {
 			if (unique) {
 				_stars->paint(p);
 			} else {

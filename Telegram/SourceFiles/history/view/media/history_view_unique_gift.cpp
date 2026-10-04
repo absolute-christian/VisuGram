@@ -32,6 +32,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/effects/premium_stars_colored.h"
 #include "ui/effects/ripple_animation.h"
 #include "ui/layers/generic_box.h"
+#include "ui/dynamic_image.h"
+#include "ui/dynamic_thumbnails.h"
 #include "ui/text/text_utilities.h"
 #include "ui/painter.h"
 #include "ui/power_saving.h"
@@ -44,6 +46,83 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace HistoryView {
 namespace {
+
+class GiftCommentPart final : public MediaGenericTextPart {
+public:
+	GiftCommentPart(not_null<Element*> parent, const Data::UniqueGift &gift)
+	: MediaGenericTextPart(
+		gift.originalDetails.message,
+		QMargins(st::chatUniqueCommentAvatar + st::chatUniqueCommentSkip
+			+ st::chatUniqueCommentPadding.left(),
+			st::chatUniqueCommentPadding.top(),
+			st::chatUniqueCommentPadding.right(),
+			st::chatUniqueCommentPadding.bottom()),
+		st::chatUniqueTextStyle,
+		{},
+		{},
+		style::al_topleft)
+	, _backdrop(gift.backdrop)
+	, _avatar(gift.originalDetails.senderId
+		? Ui::MakeUserpicThumbnail(parent->history()->owner().peer(
+			gift.originalDetails.senderId), true)
+		: Ui::MakeHiddenAuthorThumbnail()) {
+		_avatar->subscribeToUpdates([parent] { parent->repaint(); });
+	}
+
+	~GiftCommentPart() {
+		_avatar->subscribeToUpdates(nullptr);
+	}
+
+	QSize countOptimalSize() override {
+		auto size = MediaGenericTextPart::countOptimalSize();
+		size.setHeight(std::max(size.height(), st::chatUniqueCommentAvatar));
+		return size;
+	}
+
+	QSize countCurrentSize(int newWidth) override {
+		auto size = MediaGenericTextPart::countCurrentSize(newWidth);
+		size.setHeight(std::max(size.height(), st::chatUniqueCommentAvatar));
+		return size;
+	}
+
+	void draw(
+			Painter &p,
+			not_null<const MediaGeneric*> owner,
+			const PaintContext &context,
+			int outerWidth) const override {
+		p.save();
+		p.translate((outerWidth - width()) / 2, 0);
+		const auto avatar = st::chatUniqueCommentAvatar;
+		const auto left = avatar + st::chatUniqueCommentSkip;
+		const auto radius = st::chatUniqueCommentRadius;
+		p.setPen(Qt::NoPen);
+		p.setBrush(anim::with_alpha(_backdrop.patternColor, 0.3));
+		p.drawRoundedRect(QRect(left, 0, width() - left, height()), radius, radius);
+		p.drawImage(QRect(0, (height() - avatar) / 2, avatar, avatar),
+			_avatar->image(avatar));
+		MediaGenericTextPart::draw(p, owner, context, width());
+		p.restore();
+	}
+
+	TextState textState(
+			QPoint point,
+			StateRequest request,
+			int outerWidth) const override {
+		point.rx() -= (outerWidth - width()) / 2;
+		return MediaGenericTextPart::textState(point, request, width());
+	}
+
+private:
+	void setupPen(
+			Painter &p,
+			not_null<const MediaGeneric*> owner,
+			const PaintContext &context) const override {
+		p.setPen(_backdrop.textColor);
+	}
+
+	Data::UniqueGiftBackdrop _backdrop;
+	std::shared_ptr<Ui::DynamicImage> _avatar;
+};
 
 class ButtonPart final : public MediaGenericPart {
 public:
@@ -408,11 +487,15 @@ auto GenerateUniqueGiftMedia(
 		const auto tableAddedMargins = gift->releasedBy
 			? QMargins(0, st::chatUniqueAuthorSkip, 0, 0)
 			: QMargins();
-		push(std::make_unique<AttributeTable>(
-			std::move(attributes),
-			st::chatUniqueTextPadding + tableAddedMargins,
-			[c = gift->backdrop.textColor](const auto&) { return c; },
-			[](const auto&) { return QColor(255, 255, 255); }));
+		if (!gift->originalDetails.message.empty() && item->isLocal()) {
+			push(std::make_unique<GiftCommentPart>(parent, *gift));
+		} else {
+			push(std::make_unique<AttributeTable>(
+				std::move(attributes),
+				st::chatUniqueTextPadding + tableAddedMargins,
+				[c = gift->backdrop.textColor](const auto&) { return c; },
+				[](const auto&) { return QColor(255, 255, 255); }));
+		}
 
 		auto link = OpenStarGiftLink(parent->data());
 		push(std::make_unique<ButtonPart>(

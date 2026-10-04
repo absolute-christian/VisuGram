@@ -1,6 +1,7 @@
 #pragma once
 
 #include "data/data_star_gift.h"
+#include <QtCore/QJsonObject>
 
 class History;
 
@@ -30,6 +31,23 @@ namespace Ayu::Visual {
 [[nodiscard]] bool SetEnabled(not_null<Main::Session*> session, bool enabled);
 [[nodiscard]] QString Phone(not_null<Main::Session*> session);
 [[nodiscard]] QStringList Usernames(not_null<Main::Session*> session);
+[[nodiscard]] QString SyncServer(not_null<Main::Session*> session);
+[[nodiscard]] bool SetSyncServer(not_null<Main::Session*> session, QString endpoint);
+[[nodiscard]] QString PhoneFor(not_null<PeerData*> peer);
+[[nodiscard]] QStringList DisplayUsernames(not_null<PeerData*> peer);
+[[nodiscard]] bool IsVisualUsername(not_null<PeerData*> peer, QString name);
+[[nodiscard]] QJsonObject CollectibleMetadata(not_null<PeerData*> peer, QString entity);
+[[nodiscard]] QString SyncError(QString code);
+void SaveProfile(not_null<Main::Session*> session,
+	QString phone, QStringList names, QString primary, Fn<void(QString)> done);
+void SendGift(not_null<PeerData*> recipient, const MTPStarGift &source,
+	QString message, bool anonymous, CreditsAmount price, QString operation,
+	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
+void ManageGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
+	bool pinned, bool hidden, Fn<void(QString)> done);
+void ShowCollectible(not_null<Window::SessionController*> window,
+	not_null<PeerData*> peer, QString entity);
+void ShowSyncSettings(not_null<Window::SessionController*> window);
 [[nodiscard]] bool SetProfile(
 	not_null<Main::Session*> session,
 	QString phone,
@@ -37,6 +55,9 @@ namespace Ayu::Visual {
 [[nodiscard]] std::vector<Data::SavedStarGift> Gifts(
 	not_null<PeerData*> peer,
 	bool pinnedOnly = false);
+[[nodiscard]] int GiftCount(not_null<PeerData*> peer);
+[[nodiscard]] bool IsSyncedGift(
+	not_null<Main::Session*> session, Data::SavedStarGiftId id);
 [[nodiscard]] bool IsLocal(
 	not_null<Main::Session*> session,
 	Data::SavedStarGiftId id);
@@ -50,7 +71,8 @@ namespace Ayu::Visual {
 	not_null<PeerData*> recipient,
 	const MTPStarGift &gift,
 	QString message,
-	bool anonymous);
+	bool anonymous,
+	CreditsAmount price = CreditsAmount());
 [[nodiscard]] bool SetPinned(
 	not_null<Main::Session*> session,
 	Data::SavedStarGiftId id,

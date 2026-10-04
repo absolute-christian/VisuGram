@@ -187,6 +187,7 @@ public:
 	using Mode = GiftButtonMode;
 	void setDescriptor(const GiftDescriptor &descriptor, Mode mode);
 	void setGeometry(QRect inner, QMargins extend);
+	void setLightweightAnimations(bool enabled);
 
 	void toggleSelected(
 		bool selected,
@@ -257,6 +258,7 @@ private:
 	bool _selected : 1 = false;
 	bool _locked : 1 = false;
 	bool _playerFinished : 1 = false;
+	bool _lightweightAnimations : 1 = false;
 
 	bool _mouseEventsAreListening = false;
 

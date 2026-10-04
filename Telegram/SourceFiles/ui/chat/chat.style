@@ -1105,6 +1105,10 @@ chatUniqueTextPadding: margins(12px, 2px, 12px, 7px);
 chatUniqueTextStyle: TextStyle(defaultTextStyle) {
 	font: font(12px);
 }
+chatUniqueCommentAvatar: 32px;
+chatUniqueCommentSkip: 6px;
+chatUniqueCommentPadding: margins(10px, 8px, 10px, 8px);
+chatUniqueCommentRadius: 16px;
 chatUniqueAuthorSkip: 6px;
 chatUniqueTableSkip: 9px;
 chatUniqueRowSkip: 2px;
