@@ -1,38 +1,29 @@
+<div align="center">
+
 # VisuGram
 
-[English](README.md) · [Скачать](https://github.com/absolute-christian/VisuGram/releases)
+AyuGram с визуальными подарками, коллекционными номерами и юзернеймами.
 
-Форк [AyuGram Desktop](https://github.com/AyuGram/AyuGramDesktop) с визуальными подарками, коллекционными номерами и юзернеймами.
+**[Скачать для Windows](https://github.com/absolute-christian/VisuGram/releases)** · [English](README.md)
 
-По умолчанию изменения локальные. Общий сервер может синхронизировать их между пользователями VisuGram. Данные аккаунта Telegram, реальный баланс звёзд и владение NFT остаются прежними.
+</div>
 
-## Возможности
+---
 
-- Переключатель «Визуальные звёзды» в «Мои звёзды» с отображением бесконечного баланса.
-- Публичный каталог подарков с коллекционными моделями, узорами и фонами.
-- Локальное дарение, включая отправку себе в Избранное.
-- Коллекция подарков в профиле: скрытие, удаление и закрепление до шести коллекционных подарков.
-- Существующие номера +888 и дополнительные NFT-юзернеймы с информацией о цене.
-- Общие визуальные профили и подарки через настраиваемый сервер.
-- Окно коллекционного подарка с атрибутами, ношением, передачей и визуальной продажей.
-- Русские и английские подписи новых элементов интерфейса.
+### Установка
 
-## Установка
+1. Открой [Releases](https://github.com/absolute-christian/VisuGram/releases) и скачай ZIP из самого свежего релиза.
+2. Достань из архива `VisuGram.exe` и папку `TelegramForcePortable`. Положи их вместе в одну папку.
+3. Запусти `VisuGram.exe`.
 
-1. Скачай ZIP для Windows x64 из [Releases](https://github.com/absolute-christian/VisuGram/releases).
-2. Распакуй его в отдельную папку.
-3. Запусти `VisuGram.exe`. Оставь `TelegramForcePortable` рядом — в ней хранятся данные аккаунта.
+```text
+VisuGram/
+├── VisuGram.exe
+└── TelegramForcePortable/
+```
 
-Включи **Мои звёзды → Визуальные звёзды**, чтобы пользоваться локальными подарками. Визуальный номер и юзернеймы задаются в **Редактировать профиль**.
+---
 
-Для общих профилей и коллекционных подарков укажи в **Редактировать профиль → Сервер синхронизации** адрес `https://visugram-api-production.up.railway.app`. Каждый участник подключается один раз. Перед подключением прочитай [проект политики обработки данных](docs/privacy.md).
-
-Текущий релиз — экспериментальная Debug-версия; работа функций пока не проверена вручную.
-
-## Документация
-
-[Визуальный режим](docs/visual-mode.md) · [Облачная сборка](docs/cloud-build.md) · [Синхронизация](docs/synchronization-plan.md)
-
-## Основа проекта
-
-[AyuGram](https://github.com/AyuGram/AyuGramDesktop) и [Telegram Desktop](https://github.com/telegramdesktop/tdesktop). Лицензии и авторство исходных проектов сохранены: [LICENSE](LICENSE), [LEGAL](LEGAL).
+<div align="center">
+<sub>На основе <a href="https://github.com/AyuGram/AyuGramDesktop">AyuGram</a> и <a href="https://github.com/telegramdesktop/tdesktop">Telegram Desktop</a> · <a href="LICENSE">GPL-3.0</a></sub>
+</div>
