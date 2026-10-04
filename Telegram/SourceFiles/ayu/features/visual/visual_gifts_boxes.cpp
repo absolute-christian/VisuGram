@@ -368,13 +368,26 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 				initialNames.push_back(name);
 			}
 		}
+		auto initialPhone = Phone(session);
+		if (initialPhone.startsWith(u"+888")) {
+			initialPhone.remove(0, 4);
+		}
 		const auto field = box->addRow(object_ptr<Ui::InputField>(
 			box, st::defaultInputField,
 			editPhone ? Ui::InputField::Mode::SingleLine : Ui::InputField::Mode::MultiLine,
-			rpl::single(editPhone ? u"+888 …"_q : u"@username"_q),
-			editPhone ? (Phone(session).isEmpty() ? u"+888"_q : Phone(session))
-				: initialNames.join('\n')), st::boxRowPadding);
+			rpl::single(editPhone ? u"…"_q : u"@username"_q),
+			editPhone ? initialPhone.trimmed() : initialNames.join('\n')), st::boxRowPadding);
 		field->setMaxLength(editPhone ? 32 : 1024);
+		if (editPhone) {
+			const auto margins = field->fullTextMargins();
+			const auto prefixWidth = st::boxLabel.style.font->width(u"+888 "_q);
+			field->setAdditionalMargins(QMargins(prefixWidth, 0, 0, 0));
+			const auto prefix = Ui::CreateChild<Ui::FlatLabel>(
+				field, rpl::single(u"+888"_q), st::boxLabel);
+			prefix->setAttribute(Qt::WA_TransparentForMouseEvents);
+			prefix->resizeToWidth(prefixWidth);
+			prefix->moveToLeft(margins.left(), margins.top());
+		}
 		const auto saving = box->lifetime().make_state<bool>(false);
 		box->addButton(tr::lng_settings_save(), [=] {
 			if (*saving) {
@@ -392,31 +405,39 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 				}
 				phone = text;
 				phone.remove(QRegularExpression(u"[^0-9]"_q));
-				if (phone == u"888" || phone.isEmpty()) {
-					phone.clear();
-				} else {
-					if (phone.size() == 8) {
-						phone.prepend(u"888"_q);
-					}
-					if (!QRegularExpression(u"^888[0-9]{8}$"_q).match(phone).hasMatch()) {
+				if (text.startsWith('+') || phone.size() > 8) {
+					if (!phone.startsWith(u"888")) {
 						field->showError();
+						window->showToast(SyncError(u"INVALID_PHONE"_q));
 						return;
 					}
-					phone.prepend('+');
+					phone.remove(0, 3);
+				}
+				if (!phone.isEmpty()) {
+					if (!QRegularExpression(u"^[0-9]{1,8}$"_q).match(phone).hasMatch()) {
+						field->showError();
+						window->showToast(SyncError(u"INVALID_PHONE"_q));
+						return;
+					}
+					phone.prepend(u"+888"_q);
 				}
 			} else {
 				names.clear();
 				primary.clear();
 				auto seen = QStringList();
-				const auto pattern = QRegularExpression(u"^[a-z][a-z0-9_]{3,31}$"_q);
+				const auto pattern = QRegularExpression(u"^[a-z][a-z0-9_]{0,31}$"_q);
 				for (auto name : text.split('\n', Qt::SkipEmptyParts)) {
 					name = name.trimmed().toLower();
+					if (name.isEmpty()) {
+						continue;
+					}
 					if (name.startsWith('@')) {
 						name.remove(0, 1);
 					}
 					if (!pattern.match(name).hasMatch()
 						|| seen.contains(name) || seen.size() >= 20) {
 						field->showError();
+						window->showToast(SyncError(u"INVALID_USERNAME"_q));
 						return;
 					}
 					const auto native = ranges::any_of(session->user()->usernames(),
@@ -719,12 +740,15 @@ void ShowSyncSettings(not_null<Window::SessionController*> window) {
 		box->setTitle(TextValue(u"Visual sync server"_q, u"Сервер синхронизации"_q));
 		box->setWidth(st::boxWideWidth);
 		AddLabel(box, Text(
-			u"Synchronizes your Telegram ID, basic username, visual profile and gifts with this server. Visual profiles are visible to other users connected to it. Leave empty to disconnect."_q,
-			u"Передаёт этому серверу Telegram ID, настоящий юзернейм, визуальный профиль и подарки. Профиль виден другим подключённым пользователям. Оставьте поле пустым для отключения."_q));
+			u"The VisuGram server is configured automatically. It synchronizes your Telegram ID, basic username, visual profile and gifts. Visual profiles are visible to other connected users. Leave empty to disconnect."_q,
+			u"Сервер VisuGram подключается автоматически. Он синхронизирует Telegram ID, настоящий юзернейм, визуальный профиль и подарки. Профиль виден другим подключённым пользователям. Оставьте поле пустым для отключения."_q));
 		const auto field = box->addRow(object_ptr<Ui::InputField>(
 			box, st::defaultInputField, Ui::InputField::Mode::SingleLine,
 			rpl::single(u"https://…"_q), SyncServer(session)), st::boxRowPadding);
 		field->setMaxLength(512);
+		box->addLeftButton(TextValue(u"Default server"_q, u"По умолчанию"_q), [=] {
+			field->setText(DefaultSyncServer());
+		});
 		box->addButton(tr::lng_settings_save(), [=] {
 			if (!SetSyncServer(session, field->getLastText())) {
 				field->showError();

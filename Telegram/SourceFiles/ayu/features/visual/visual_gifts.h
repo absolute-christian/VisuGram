@@ -32,6 +32,7 @@ namespace Ayu::Visual {
 [[nodiscard]] bool SetEnabled(not_null<Main::Session*> session, bool enabled);
 [[nodiscard]] QString Phone(not_null<Main::Session*> session);
 [[nodiscard]] QStringList Usernames(not_null<Main::Session*> session);
+[[nodiscard]] QString DefaultSyncServer();
 [[nodiscard]] QString SyncServer(not_null<Main::Session*> session);
 [[nodiscard]] bool SetSyncServer(not_null<Main::Session*> session, QString endpoint);
 [[nodiscard]] QString PhoneFor(not_null<PeerData*> peer);
@@ -82,7 +83,8 @@ void ShowSyncSettings(not_null<Window::SessionController*> window);
 	const MTPStarGift &gift,
 	QString message,
 	bool anonymous,
-	CreditsAmount price = CreditsAmount());
+	CreditsAmount price = CreditsAmount(),
+	bool localOnly = false);
 [[nodiscard]] bool SetPinned(
 	not_null<Main::Session*> session,
 	Data::SavedStarGiftId id,

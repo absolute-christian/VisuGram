@@ -1,17 +1,30 @@
-VisuGram — дополнение к AyuGram с локальными визуальными подарками, бесконечным визуальным балансом, номером и NFT-юзернеймами.
+VisuGram Windows x64
 
-Скачайте ZIP, распакуйте целиком в отдельную папку и запустите **VisuGram.exe**. Папка **TelegramForcePortable** должна оставаться рядом.
+Скачай ZIP. Распакуй **VisuGram.exe** и папку **TelegramForcePortable** вместе, затем запусти EXE.
 
-Это экспериментальная Windows x64 Debug-сборка, без подписи и автоматического обновления. Компиляция проверяется workflow; вход в аккаунт, анимации и визуальные сценарии требуют ручной проверки.
+В этом апдейте:
 
-В этой версии:
+- Общий сервер синхронизации встроен в приложение. Новые установки и обновления с пустым адресом подключаются автоматически.
+- Кнопка **«По умолчанию»** возвращает адрес общего сервера. Другой адрес или отключение сохраняются после перезапуска.
+- Короткие визуальные юзернеймы больше не отклоняются. Учитываются страницы поиска и статус Taken на Fragment; если цены нет, используется визуальная цена 7–10 TON.
+- Поддерживаются короткие коллекционные номера. Префикс **+888** закреплён в поле ввода и не удаляется.
+- Сохранение профиля ждёт завершения текущей синхронизации. Ошибки сервера, Fragment и неподтверждённого номера теперь различаются.
+- Подарок можно отправить незарегистрированному получателю: он останется локально. Зарегистрированному получателю подарок добавляется в общую БД.
+- В строке подарков профиля показывается не больше трёх значков.
+- Один юзернейм, номер или NFT может быть закреплён только за одним аккаунтом в общей БД.
 
-- Штатный каталог All Gifts / Collectibles с ценами Telegram; покупка остаётся локальной.
-- Штатные фильтры по модели, фону и символу, сортировка по цене, дате и номеру, выбор All Listings / For Stars Only.
-- Восстановление локальных сообщений по исходной дате и исправленная подпись получателя.
-- Закрепление и скрытие доступны только для своих подарков.
-- Загрузка страниц при прокрутке, освобождение карточек за экраном и обновление ресурсов видимых локальных подарков с ограничением параллельных запросов.
+Визуальные профили и подарки видны пользователям одного сервера VisuGram. Реальные Stars, NFT и профиль Telegram не меняются.
 
-Все визуальные изменения видны только в этом клиенте. Они не выполняют настоящую оплату, передачу NFT, регистрацию юзернеймов или смену номера. Данные аккаунтов в ZIP не включены.
+Windows x64 Debug-сборка. Автоматического обновления клиента пока нет.
 
-VisuGram extends AyuGram with local visual gifts, an infinity display for Stars, and visual profile phone numbers and collectible usernames. Extract the ZIP and run VisuGram.exe, keeping TelegramForcePortable beside it. This is an experimental Windows x64 Debug preview. Visual changes are local and do not change Telegram payments or ownership.
+---
+
+Extract **VisuGram.exe** and **TelegramForcePortable** together, then launch the EXE.
+
+The shared sync server is now built in. New installations and unconfigured upgrades connect automatically; **Default server** restores its address. Custom addresses and disconnection persist after restarting.
+
+Short visual usernames are supported. Fragment search pages and Taken usernames use a visual 7–10 TON price when no market price exists. Profile saves wait for the current sync; connection, lookup and number validation errors are shown separately. Short +888 numbers are supported with a fixed prefix. Collectibles remain unique per owner in the shared database.
+
+Gifts to unregistered recipients stay local; registered recipients receive them in the shared database. Profile gift previews are limited to three icons.
+
+Visual changes do not change real Telegram payments or ownership. Windows x64 Debug preview; client auto-updates are not available yet.

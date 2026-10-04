@@ -46,6 +46,7 @@ struct Record {
 	bool resourcesRequested = false;
 	crl::time resourceAttempt = 0;
 	bool worn = false;
+	bool localOnly = false;
 };
 
 class State final {
@@ -106,6 +107,7 @@ public:
 	PeerId watchedPeer;
 	bool syncing = false;
 	bool profileSaving = false;
+	Fn<void()> pendingProfileSave;
 	int requestsLoading = 0;
 
 private:
@@ -196,6 +198,7 @@ QString State::path() const {
 void State::load() {
 	auto file = QFile(path());
 	if (!file.exists()) {
+		endpoint = DefaultSyncServer();
 		return;
 	}
 	if (!file.open(QIODevice::ReadOnly) || file.size() > kMaxFileSize) {
@@ -212,7 +215,11 @@ void State::load() {
 		writable = false;
 		return;
 	}
-	endpoint = root.value(u"sync_server"_q).toString();
+	const auto savedEndpoint = root.value(u"sync_server"_q).toString();
+	endpoint = !savedEndpoint.isEmpty()
+		|| root.value(u"sync_server_configured"_q).toBool()
+		? savedEndpoint
+		: DefaultSyncServer();
 	cursor = root.value(u"sync_cursor"_q).toString();
 	ownProfile = root.value(u"sync_profile"_q).toObject();
 	serverGifts = root.value(u"server_gifts"_q).toArray();
@@ -273,6 +280,7 @@ void State::loadRecords() {
 					? CreditsType::Ton
 					: CreditsType::Stars),
 		});
+		records.back().localOnly = object.value(u"local_only"_q).toBool();
 		records.back().worn = records.back().gift.mine
 			&& object.value(u"worn"_q).toBool();
 	}
@@ -303,6 +311,7 @@ bool State::save() {
 			{ u"pinned"_q, gift.pinned },
 			{ u"hidden"_q, gift.hidden },
 			{ u"worn"_q, record.worn },
+			{ u"local_only"_q, record.localOnly },
 			{ u"price_whole"_q, QString::number(record.price.whole()) },
 			{ u"price_nano"_q, int(record.price.nano()) },
 			{ u"price_ton"_q, record.price.ton() },
@@ -313,6 +322,7 @@ bool State::save() {
 		{ u"account"_q, QString::number(session->uniqueId()) },
 		{ u"enabled"_q, enabled.current() },
 		{ u"sync_server"_q, endpoint },
+		{ u"sync_server_configured"_q, true },
 		{ u"sync_cursor"_q, cursor },
 		{ u"sync_profile"_q, ownProfile },
 		{ u"server_gifts"_q, serverGifts },
@@ -342,7 +352,7 @@ void State::updateWornStatuses() {
 	if (enabled.current()) {
 		for (const auto &record : records) {
 			if (record.worn && record.active && !record.gift.hidden && record.gift.info.unique
-				&& (endpoint.isEmpty() || !record.serverId.isEmpty())) {
+				&& (endpoint.isEmpty() || record.localOnly || !record.serverId.isEmpty())) {
 				updated.emplace(record.recipient,
 					session->data().emojiStatuses().fromUniqueGift(*record.gift.info.unique));
 			}
@@ -599,6 +609,13 @@ void State::sync() {
 		{ u"telegram_username"_q, session->user()->editableUsername() },
 	}, [=](QJsonObject object, QString error) {
 		syncing = false;
+		if (pendingProfileSave) {
+			QTimer::singleShot(0, &network, [this] {
+				if (const auto save = base::take(pendingProfileSave)) {
+					save();
+				}
+			});
+		}
 		if (!error.isEmpty() || object.value(u"unchanged"_q).toBool()) {
 			return;
 		}
@@ -1041,6 +1058,10 @@ QStringList Usernames(not_null<Main::Session*> session) {
 	return result;
 }
 
+QString DefaultSyncServer() {
+	return u"https://visugram-api-production.up.railway.app"_q;
+}
+
 QString SyncServer(not_null<Main::Session*> session) {
 	return Get(session).endpoint;
 }
@@ -1170,9 +1191,24 @@ QString SyncError(QString code) {
 	if (code == u"ASSET_TAKEN") {
 		return Text(u"This collectible already belongs to another VisuGram user."_q,
 			u"Этот коллекционный объект уже занят другим пользователем VisuGram."_q);
-	} else if (code == u"PHONE_NOT_FOUND" || code == u"INVALID_PHONE") {
+	} else if (code == u"PHONE_NOT_FOUND") {
+		return Text(u"This collectible number was not found on Fragment."_q,
+			u"Этот коллекционный номер не найден на Fragment."_q);
+	} else if (code == u"INVALID_PHONE") {
 		return Text(u"Enter an existing collectible +888 number."_q,
 			u"Введите существующий коллекционный номер +888."_q);
+	} else if (code == u"INVALID_USERNAME") {
+		return Text(u"Use up to 20 unique usernames: 1–32 Latin letters, digits or underscores, starting with a letter."_q,
+			u"Укажите до 20 юзернеймов без повторов: 1–32 латинских символа, цифры или _, начиная с буквы."_q);
+	} else if (code == u"SOURCE_UNAVAILABLE") {
+		return Text(u"Fragment could not be reached. Try again later."_q,
+			u"Не удалось получить данные Fragment. Попробуйте позже."_q);
+	} else if (code == u"SERVER_UNAVAILABLE" || code == u"ENDPOINT_CHANGED") {
+		return Text(u"Could not connect to the VisuGram server. Check your connection and server address."_q,
+			u"Нет соединения с сервером VisuGram. Проверьте сеть и адрес сервера."_q);
+	} else if (code == u"BUSY") {
+		return Text(u"Another request is still running. Wait and try again."_q,
+			u"Другой запрос ещё выполняется. Подождите и повторите попытку."_q);
 	} else if (code == u"SERVER_REQUIRED") {
 		return Text(u"Configure the visual sync server in Edit Profile first."_q,
 			u"Сначала укажите сервер синхронизации в разделе «Редактировать профиль»."_q);
@@ -1210,8 +1246,20 @@ void SaveProfile(
 		QString primary,
 		Fn<void(QString)> done) {
 	auto &state = Get(session);
-	if (state.profileSaving || state.syncing) {
+	if (state.profileSaving || state.pendingProfileSave) {
 		done(u"BUSY"_q);
+		return;
+	}
+	if (state.syncing) {
+		state.pendingProfileSave = [
+			&state,
+			phone = std::move(phone),
+			names = std::move(names),
+			primary = std::move(primary),
+			done = std::move(done)]() mutable {
+			SaveProfile(state.session, std::move(phone), std::move(names),
+				std::move(primary), std::move(done));
+		};
 		return;
 	}
 	state.profileSaving = true;
@@ -1272,10 +1320,23 @@ void SendGift(
 			? price.whole() * 1'000'000'000 + price.nano() : price.whole()) },
 		{ u"currency"_q, price.ton() ? u"TON"_q : u"XTR"_q },
 		{ u"operation_id"_q, operation },
-	}, [&state, done = std::move(done)](QJsonObject object, QString error) {
+	}, [
+		&state,
+		recipient,
+		source,
+		message,
+		anonymous,
+		price,
+		done = std::move(done)](QJsonObject object, QString error) mutable {
 		if (!error.isEmpty()) {
 			state.sync();
 			done({}, std::move(error));
+			return;
+		}
+		if (object.value(u"local_only"_q).toBool()) {
+			const auto gift = AddGift(
+				recipient, source, std::move(message), anonymous, price, true);
+			done(gift, gift ? QString() : u"STORAGE_ERROR"_q);
 			return;
 		}
 		const auto value = object.value(u"gift"_q).toObject();
@@ -1391,13 +1452,20 @@ void TransferGift(
 		done(u"SERVER_REQUIRED"_q);
 		return;
 	}
+	const auto source = found->source;
 	state.request(u"/v1/gifts/transfer"_q, {
 		{ u"id"_q, found->serverId },
 		{ u"recipient_id"_q, QString::number(peerToUser(recipient->id).bare) },
 		{ u"operation_id"_q, QUuid::createUuid().toString(QUuid::WithoutBraces) },
-	}, [&state, done = std::move(done)](QJsonObject object, QString error) {
+	}, [&state, recipient, source, done = std::move(done)](
+			QJsonObject object, QString error) {
 		if (error.isEmpty()) {
+			const auto localOnly = object.value(u"local_only"_q).toBool();
 			state.acceptMutation(std::move(object), true);
+			if (localOnly && !AddGift(recipient, source, QString(), false,
+					CreditsAmount(), true)) {
+				error = u"STORAGE_ERROR"_q;
+			}
 		}
 		done(std::move(error));
 	});
@@ -1486,7 +1554,7 @@ std::vector<Data::SavedStarGift> Gifts(
 	}
 	for (const auto &record : state.records) {
 		if (record.recipient == peer->id && record.active
-			&& (state.endpoint.isEmpty() || !record.serverId.isEmpty())
+			&& (state.endpoint.isEmpty() || record.localOnly || !record.serverId.isEmpty())
 			&& (peer->isSelf() || !record.gift.hidden)
 			&& (!pinnedOnly || (record.gift.pinned && !record.gift.hidden))) {
 			result.push_back(record.gift);
@@ -1504,14 +1572,15 @@ int GiftCount(not_null<PeerData*> peer) {
 		return 0;
 	}
 	auto count = int(ranges::count_if(state.records, [&](const Record &record) {
-		return state.endpoint.isEmpty() && record.serverId.isEmpty() && record.recipient == peer->id
+		return (state.endpoint.isEmpty() || record.localOnly)
+			&& record.serverId.isEmpty() && record.recipient == peer->id
 			&& (peer->isSelf() || !record.gift.hidden);
 	}));
 	for (const auto &value : state.pendingRecords) {
-		if (!state.endpoint.isEmpty()) {
-			break;
-		}
 		const auto object = value.toObject();
+		if (!state.endpoint.isEmpty() && !object.value(u"local_only"_q).toBool()) {
+			continue;
+		}
 		if (object.value(u"recipient"_q).toString() == QString::number(peer->id.value)
 			&& (peer->isSelf() || !object.value(u"hidden"_q).toBool())) {
 			++count;
@@ -1576,7 +1645,8 @@ std::optional<Data::SavedStarGift> AddGift(
 		const MTPStarGift &source,
 		QString message,
 		bool anonymous,
-		CreditsAmount price) {
+		CreditsAmount price,
+		bool localOnly) {
 	auto &state = Get(&recipient->session());
 	if (!state.enabled.current()) {
 		return {};
@@ -1595,6 +1665,7 @@ std::optional<Data::SavedStarGift> AddGift(
 		base::unixtime::now(),
 		anonymous);
 	state.records.push_back({ source, gift, recipient->id, Encode(source), price });
+	state.records.back().localOnly = localOnly;
 	if (!state.save()) {
 		state.records.pop_back();
 		return {};

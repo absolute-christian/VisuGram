@@ -64,6 +64,10 @@ void RecentSharedMediaGifts::request(
 	done = [=](std::vector<SavedStarGift> gifts) {
 		auto combined = Ayu::Visual::Gifts(peer, onlyPinnedToTop);
 		combined.insert(end(combined), begin(gifts), end(gifts));
+		const auto limit = onlyPinnedToTop ? kMaxPinnedGifts : kMaxGifts;
+		if (combined.size() > limit) {
+			combined.resize(limit);
+		}
 		originalDone(std::move(combined));
 	};
 	const auto it = _recent.find(peer->id);
