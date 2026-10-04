@@ -52,9 +52,10 @@ jobs:
       - name: Prepare build tools
         run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 bootstrap
       - name: Compile dependencies
+        id: prepared_dependencies
         run: ./TBuild/tdesktop/.github/scripts/cloud-build.ps1 dependencies
       - uses: actions/cache/save@v4
-        if: always() && !cancelled() && steps.dependencies.outputs.cache-hit != 'true'
+        if: always() && !cancelled() && steps.dependencies.outputs.cache-hit != 'true' && (steps.prepared_dependencies.outcome == 'failure' || steps.prepared_dependencies.outputs.cache_changed == 'true')
         with:
           path: |
             TBuild/Libraries/win64

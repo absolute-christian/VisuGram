@@ -14,6 +14,18 @@ $buildRoot = Split-Path $sourceRoot -Parent
 $thirdPartyRoot = Join-Path $buildRoot 'ThirdParty'
 $librariesRoot = Join-Path $buildRoot 'Libraries/win64'
 
+function Get-DependencyCacheFingerprint {
+    $entries = foreach ($cacheRoot in @($librariesRoot, $thirdPartyRoot)) {
+        $keysPath = Join-Path $cacheRoot 'cache_keys'
+        if (Test-Path -LiteralPath $keysPath) {
+            Get-ChildItem -LiteralPath $keysPath -File | Sort-Object Name | ForEach-Object {
+                "$cacheRoot/$($_.Name):$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            }
+        }
+    }
+    return ($entries -join '|')
+}
+
 function Invoke-NativeBuild([string[]]$Commands) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
     $vsRoot = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -37,6 +49,7 @@ function Invoke-NativeBuild([string[]]$Commands) {
 
 switch ($Phase) {
     'bootstrap' {
+        [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'visugram-cache-before.txt'), (Get-DependencyCacheFingerprint), [Text.UTF8Encoding]::new($false))
         $stages = @(
             @{ Name = 'patches'; Key = (Join-Path $librariesRoot 'cache_keys/patches') },
             @{ Name = 'msys64'; Key = (Join-Path $thirdPartyRoot 'cache_keys/msys64') },
@@ -64,6 +77,10 @@ switch ($Phase) {
     }
     'dependencies' {
         Invoke-NativeBuild @('call build\prepare\win.bat silent skip-release')
+        $beforePath = Join-Path $env:RUNNER_TEMP 'visugram-cache-before.txt'
+        $before = [IO.File]::ReadAllText($beforePath)
+        $cacheChanged = $before -cne (Get-DependencyCacheFingerprint)
+        "cache_changed=$($cacheChanged.ToString().ToLowerInvariant())" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Append -Encoding utf8
     }
     'build' {
         $apiId = if ($env:VISUGRAM_API_ID) { $env:VISUGRAM_API_ID } else { '2040' }
@@ -73,7 +90,7 @@ switch ($Phase) {
         }
         Invoke-NativeBuild @(
             "call configure.bat `"-GNinja Multi-Config`" debug -DCMAKE_CONFIGURATION_TYPES=Debug -DTDESKTOP_API_ID=$apiId -DTDESKTOP_API_HASH=$apiHash -DDESKTOP_APP_DISABLE_AUTOUPDATE=ON -DDESKTOP_APP_DISABLE_CRASH_REPORTS=ON -DDESKTOP_APP_ENABLE_LTO=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded",
-            'cmake --build ..\out --config Debug --target Telegram --parallel 2'
+            'cmake --build ..\out --config Debug --target Telegram --parallel 2 -- -k 0'
         )
     }
     'package' {

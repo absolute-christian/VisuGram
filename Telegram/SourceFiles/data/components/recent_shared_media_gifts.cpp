@@ -142,6 +142,9 @@ void RecentSharedMediaGifts::updatePinnedOrder(
 	auto inputs = QVector<MTPInputSavedStarGift>();
 	inputs.reserve(manageIds.size());
 	for (const auto &id : manageIds) {
+		if (Ayu::Visual::IsLocal(_session, id)) {
+			return;
+		}
 		inputs.push_back(Api::InputSavedStarGiftId(id));
 	}
 
@@ -176,7 +179,17 @@ void RecentSharedMediaGifts::togglePinned(
 		bool pinned,
 		std::shared_ptr<Data::UniqueGift> uniqueData,
 		std::shared_ptr<Data::UniqueGift> replacingData) {
-	const auto performToggle = [=](const std::vector<SavedStarGift> &gifts) {
+	if (Ayu::Visual::IsLocal(_session, manageId)) {
+		(void)Ayu::Visual::SetPinned(_session, manageId, pinned);
+		return;
+	}
+	const auto performToggle = [=](const std::vector<SavedStarGift> &allGifts) {
+		auto gifts = std::vector<SavedStarGift>();
+		for (const auto &gift : allGifts) {
+			if (!Ayu::Visual::IsLocal(_session, gift.manageId)) {
+				gifts.push_back(gift);
+			}
+		}
 		const auto limit = _session->appConfig().pinnedGiftsLimit();
 		auto manageIds = std::vector<Data::SavedStarGiftId>();
 
