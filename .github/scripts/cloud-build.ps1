@@ -90,7 +90,7 @@ switch ($Phase) {
         }
         Invoke-NativeBuild @(
             "call configure.bat `"-GNinja Multi-Config`" debug -DCMAKE_CONFIGURATION_TYPES=Debug -DTDESKTOP_API_ID=$apiId -DTDESKTOP_API_HASH=$apiHash -DDESKTOP_APP_DISABLE_AUTOUPDATE=ON -DDESKTOP_APP_DISABLE_CRASH_REPORTS=ON -DDESKTOP_APP_ENABLE_LTO=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded",
-            'cmake --build ..\out --config Debug --target Telegram --parallel 2 -- -k 0'
+            'cmake --build ..\out --config Debug --target Telegram --parallel 4 -- -k 0'
         )
     }
     'package' {

@@ -23,7 +23,7 @@ jobs:
       run:
         shell: pwsh
     env:
-      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
       QT: '5.15.19'
     steps:
       - uses: actions/checkout@v4
