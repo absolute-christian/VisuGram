@@ -245,7 +245,7 @@ rpl::producer<std::vector<TextWithEntities>> UsernamesValue(
 		return std::move(value) | rpl::map([=] {
 			const auto names = Ayu::Visual::Usernames(&user->session());
 			return (user->isSelf() && !names.empty())
-				? map(std::vector<QString>(begin(names), end(names)))
+				? map(std::vector<QString>(names.cbegin(), names.cend()))
 				: map(user->usernames());
 		});
 	} else if (const auto channel = peer->asChannel()) {
