@@ -24,6 +24,7 @@
 #include "window/window_session_controller.h"
 #include "styles/style_boxes.h"
 #include "styles/style_credits.h"
+#include "styles/style_layers.h"
 #include "styles/style_settings.h"
 
 #include <QtCore/QRegularExpression>
