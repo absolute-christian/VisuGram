@@ -7176,7 +7176,8 @@ void HistoryItem::setServiceMessageByAction(const MTPmessageAction &action) {
 				}
 			} else if (!from->isServiceUser() && !_history->peer->isSelf()) {
 				if (!resale || !isSelf) {
-					result.links.push_back(from->createOpenLink());
+					result.links.push_back((isLocal() && isSelf
+						? peer : from)->createOpenLink());
 				}
 				result.text = fromOffer
 					? (isSelf
@@ -7215,7 +7216,7 @@ void HistoryItem::setServiceMessageByAction(const MTPmessageAction &action) {
 							: tr::lng_action_gift_transferred))(
 								tr::now,
 								lt_user,
-								tr::link(from->shortName(), 1),
+								tr::link((isLocal() && isSelf ? peer : from)->shortName(), 1),
 								tr::marked);
 			} else if (action.is_assigned()) {
 				const auto gift = Api::FromTL(

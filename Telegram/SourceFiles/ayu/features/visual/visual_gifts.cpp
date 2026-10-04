@@ -24,11 +24,15 @@ constexpr auto kVersion = 1;
 constexpr auto kMaxFileSize = 16 * 1024 * 1024;
 constexpr auto kMaxGifts = 1000;
 constexpr auto kMaxPinned = 6;
+constexpr auto kResourceRetryDelay = crl::time(60 * 1000);
 
 struct Record {
 	MTPStarGift source;
 	Data::SavedStarGift gift;
 	PeerId recipient;
+	QByteArray encodedSource;
+	bool resourcesRequested = false;
+	crl::time resourceAttempt = 0;
 };
 
 class State final {
@@ -36,8 +40,14 @@ public:
 	explicit State(not_null<Main::Session*> session);
 	[[nodiscard]] bool save();
 	void notify();
-	void restoreMessages();
-	void refreshResources();
+	void loadRecords();
+	void restoreMessages(History *only = nullptr);
+	void restoreMessage(
+		const Record &record,
+		not_null<History*> history,
+		bool newlySent = false);
+	void refreshGift(Data::SavedStarGiftId id);
+	void requestNextResource();
 	void removeMessage(const Record &record);
 
 	const not_null<Main::Session*> session;
@@ -47,9 +57,16 @@ public:
 	QString phone;
 	QStringList usernames;
 	std::vector<Record> records;
+	std::map<MsgId, size_t> recordIndex;
 	QJsonArray unreadableRecords;
+	QJsonArray pendingRecords;
+	std::vector<Data::SavedStarGiftId> resourceQueue;
+	std::vector<mtpRequestId> resourceRequests;
+	base::flat_set<PeerId> restoredPeers;
+	int resourcesLoading = 0;
+	bool restoring = false;
 	bool writable = true;
-	bool resourcesRequested = false;
+	bool catalogRefreshed = false;
 
 private:
 	[[nodiscard]] QString path() const;
@@ -154,6 +171,12 @@ void State::load() {
 		writable = false;
 		return;
 	}
+	pendingRecords = gifts;
+	enabled = root.value(u"enabled"_q).toBool();
+}
+
+void State::loadRecords() {
+	const auto gifts = std::exchange(pendingRecords, QJsonArray());
 	for (const auto &value : gifts) {
 		const auto object = value.toObject();
 		const auto source = Decode(object.value(u"source"_q)
@@ -175,9 +198,18 @@ void State::load() {
 			object.value(u"anonymous"_q).toBool());
 		gift.pinned = object.value(u"pinned"_q).toBool() && gift.info.unique;
 		gift.hidden = object.value(u"hidden"_q).toBool();
-		records.push_back({ *source, std::move(gift), recipient });
+		if (!gift.mine) {
+			gift.pinned = false;
+			gift.hidden = false;
+		}
+		recordIndex.emplace(gift.manageId.userMessageId(), records.size());
+		records.push_back({
+			*source,
+			std::move(gift),
+			recipient,
+			object.value(u"source"_q).toString().toLatin1(),
+		});
 	}
-	enabled = root.value(u"enabled"_q).toBool();
 }
 
 bool State::save() {
@@ -185,10 +217,13 @@ bool State::save() {
 		return false;
 	}
 	auto gifts = unreadableRecords;
+	for (const auto &value : pendingRecords) {
+		gifts.push_back(value);
+	}
 	for (const auto &record : records) {
 		const auto &gift = record.gift;
 		gifts.push_back(QJsonObject{
-			{ u"source"_q, QString::fromLatin1(Encode(record.source)) },
+			{ u"source"_q, QString::fromLatin1(record.encodedSource) },
 			{ u"recipient"_q, QString::number(record.recipient.value) },
 			{ u"message"_q, gift.message.text },
 			{ u"date"_q, int(gift.date) },
@@ -226,167 +261,141 @@ void State::removeMessage(const Record &record) {
 	}
 }
 
-void State::restoreMessages() {
-	if (!enabled.current()) {
+void State::restoreMessages(History *only) {
+	if (!enabled.current() || restoring
+		|| (only && restoredPeers.contains(only->peer->id))) {
 		return;
 	}
+	loadRecords();
+	restoring = true;
+	auto histories = base::flat_set<History*>();
 	for (const auto &record : records) {
-		const auto &gift = record.gift;
-		const auto id = gift.manageId.userMessageId();
-		if (session->data().message(FullMsgId(record.recipient, id))) {
+		const auto history = session->data().historyLoaded(record.recipient);
+		if (!history || (only && history != only)) {
 			continue;
 		}
-		const auto action = [&]() -> MTPMessageAction {
-			if (gift.info.unique) {
-				const auto &original = record.source.c_starGiftUnique();
-				auto attributes = QVector<MTPStarGiftAttribute>();
-				for (const auto &attribute : original.vattributes().v) {
-					if (attribute.type() != mtpc_starGiftAttributeOriginalDetails) {
-						attributes.push_back(attribute);
-					}
+		if (!history->isEmpty()
+			|| (history->loadedAtTop() && history->loadedAtBottom())) {
+			restoreMessage(record, history);
+			histories.emplace(history);
+		}
+	}
+	for (const auto history : histories) {
+		history->checkLocalMessages();
+	}
+	if (only && (!only->isEmpty()
+		|| (only->loadedAtTop() && only->loadedAtBottom()))) {
+		restoredPeers.emplace(only->peer->id);
+	}
+	restoring = false;
+}
+
+void State::restoreMessage(
+		const Record &record,
+		not_null<History*> history,
+		bool newlySent) {
+	const auto &gift = record.gift;
+	const auto id = gift.manageId.userMessageId();
+	if (session->data().message(FullMsgId(record.recipient, id))) {
+		return;
+	}
+	const auto action = [&]() -> MTPMessageAction {
+		if (gift.info.unique) {
+			const auto &original = record.source.c_starGiftUnique();
+			auto attributes = QVector<MTPStarGiftAttribute>();
+			for (const auto &attribute : original.vattributes().v) {
+				if (attribute.type() != mtpc_starGiftAttributeOriginalDetails) {
+					attributes.push_back(attribute);
 				}
-				using DetailFlag = MTPDstarGiftAttributeOriginalDetails::Flag;
-				attributes.push_back(MTP_starGiftAttributeOriginalDetails(
-					MTP_flags((gift.anonymous ? DetailFlag() : DetailFlag::f_sender_id)
-						| (gift.message.empty() ? DetailFlag() : DetailFlag::f_message)),
-					peerToMTP(session->userPeerId()),
-					peerToMTP(record.recipient),
-					MTP_int(gift.date),
-					MTP_textWithEntities(MTP_string(gift.message.text),
-						MTPVector<MTPMessageEntity>())));
-				using GiftFlag = MTPDstarGiftUnique::Flag;
-				const auto local = MTP_starGiftUnique(
-					MTP_flags(GiftFlag::f_owner_id),
-					original.vid(),
-					original.vgift_id(),
-					original.vtitle(),
-					original.vslug(),
-					original.vnum(),
-					peerToMTP(record.recipient),
-					MTP_string(QString()),
-					MTP_string(QString()),
-					MTP_vector<MTPStarGiftAttribute>(attributes),
-					original.vavailability_issued(),
-					original.vavailability_total(),
-					MTP_string(QString()),
-					MTPVector<MTPStarsAmount>(),
-					MTPPeer(),
-					MTP_long(0),
-					MTP_string(QString()),
-					MTP_long(0),
-					MTPPeer(),
-					MTPPeerColor(),
-					MTPPeer(),
-					MTP_int(0),
-					MTP_int(0));
-				using Flag = MTPDmessageActionStarGiftUnique::Flag;
-				return MTP_messageActionStarGiftUnique(
-					MTP_flags(Flag::f_saved
-						| (gift.anonymous ? Flag() : Flag::f_from_id)),
-					local,
-					MTP_int(0),
-					MTP_long(0),
-					peerToMTP(session->userPeerId()),
-					MTPPeer(),
-					MTP_long(0),
-					MTPStarsAmount(),
-					MTP_int(0),
-					MTP_int(0),
-					MTP_long(0),
-					MTP_int(0));
 			}
-			using Flag = MTPDmessageActionStarGift::Flag;
-			return MTP_messageActionStarGift(
-				MTP_flags(Flag::f_saved
-					| (gift.anonymous ? Flag::f_name_hidden : Flag())
-					| (gift.message.empty() ? Flag() : Flag::f_message)),
-				record.source,
+			using DetailFlag = MTPDstarGiftAttributeOriginalDetails::Flag;
+			attributes.push_back(MTP_starGiftAttributeOriginalDetails(
+				MTP_flags((gift.anonymous ? DetailFlag() : DetailFlag::f_sender_id)
+					| (gift.message.empty() ? DetailFlag() : DetailFlag::f_message)),
+				peerToMTP(session->userPeerId()),
+				peerToMTP(record.recipient),
+				MTP_int(gift.date),
 				MTP_textWithEntities(MTP_string(gift.message.text),
-					MTPVector<MTPMessageEntity>()),
-				MTP_long(0),
-				MTP_int(0),
-				MTP_long(0),
-				MTPPeer(),
+					MTPVector<MTPMessageEntity>())));
+			using GiftFlag = MTPDstarGiftUnique::Flag;
+			const auto local = MTP_starGiftUnique(
+				MTP_flags(GiftFlag::f_owner_id),
+				original.vid(),
+				original.vgift_id(),
+				original.vtitle(),
+				original.vslug(),
+				original.vnum(),
+				peerToMTP(record.recipient),
+				MTP_string(QString()),
+				MTP_string(QString()),
+				MTP_vector<MTPStarGiftAttribute>(attributes),
+				original.vavailability_issued(),
+				original.vavailability_total(),
+				MTP_string(QString()),
+				MTPVector<MTPStarsAmount>(),
 				MTPPeer(),
 				MTP_long(0),
 				MTP_string(QString()),
-				MTP_int(0),
+				MTP_long(0),
 				MTPPeer(),
+				MTPPeerColor(),
+				MTPPeer(),
+				MTP_int(0),
 				MTP_int(0));
-		}();
-		using Flag = MTPDmessageService::Flag;
-		const auto message = MTP_messageService(
-			MTP_flags(Flag::f_from_id | Flag::f_out),
+			using Flag = MTPDmessageActionStarGiftUnique::Flag;
+			return MTP_messageActionStarGiftUnique(
+				MTP_flags(Flag::f_saved | Flag::f_peer
+					| (gift.anonymous ? Flag() : Flag::f_from_id)),
+				local,
+				MTP_int(0),
+				MTP_long(0),
+				peerToMTP(session->userPeerId()),
+				peerToMTP(record.recipient),
+				MTP_long(0),
+				MTPStarsAmount(),
+				MTP_int(0),
+				MTP_int(0),
+				MTP_long(0),
+				MTP_int(0));
+		}
+		using Flag = MTPDmessageActionStarGift::Flag;
+		return MTP_messageActionStarGift(
+			MTP_flags(Flag::f_saved
+				| (gift.anonymous ? Flag::f_name_hidden : Flag())
+				| Flag::f_from_id | Flag::f_peer
+				| (gift.message.empty() ? Flag() : Flag::f_message)),
+			record.source,
+			MTP_textWithEntities(MTP_string(gift.message.text),
+				MTPVector<MTPMessageEntity>()),
+			MTP_long(0),
 			MTP_int(0),
+			MTP_long(0),
 			peerToMTP(session->userPeerId()),
 			peerToMTP(record.recipient),
-			MTPPeer(),
-			MTPMessageReplyHeader(),
-			MTP_int(gift.date),
-			action,
-			MTPMessageReactions(),
-			MTPint());
-		const auto history = session->data().history(record.recipient);
-		const auto item = history->makeMessage(
-			id,
-			message.c_messageService(),
-			MessageFlag::Local | MessageFlag::HistoryEntry);
-		history->addNewLocalMessage(item);
-	}
-}
-
-void State::refreshResources() {
-	if (resourcesRequested || records.empty() || !enabled.current()) {
-		return;
-	}
-	resourcesRequested = true;
-	api.request(MTPpayments_GetStarGifts(MTP_int(0))).done([=](
-			const MTPpayments_StarGifts &result) {
-		if (result.type() == mtpc_payments_starGifts) {
-			for (const auto &source : result.c_payments_starGifts().vgifts().v) {
-				(void)Api::FromTL(session, source);
-			}
-		}
-	}).send();
-	auto slugs = base::flat_set<QString>();
-	auto sampleIds = base::flat_set<uint64>();
-	for (const auto &record : records) {
-		const auto &unique = record.gift.info.unique;
-		if (!unique) {
-			continue;
-		} else if (unique->slug.startsWith(u"Visual-")) {
-			sampleIds.emplace(unique->initialGiftId);
-		} else {
-			slugs.emplace(unique->slug);
-		}
-	}
-	for (const auto &slug : slugs) {
-		api.request(MTPpayments_GetUniqueStarGift(MTP_string(slug))).done([=](
-				const MTPpayments_UniqueStarGift &result) {
-			(void)Api::FromTL(session, result.data().vgift());
-		}).send();
-	}
-	for (const auto id : sampleIds) {
-		api.request(MTPpayments_GetResaleStarGifts(
-			MTP_flags(MTPpayments_GetResaleStarGifts::Flag::f_attributes_hash),
 			MTP_long(0),
-			MTP_long(id),
-			MTPVector<MTPStarGiftAttributeId>(),
 			MTP_string(QString()),
-			MTP_int(1)
-		)).done([=](const MTPpayments_ResaleStarGifts &result) {
-			const auto attributes = result.data().vattributes();
-			if (!attributes) {
-				return;
-			}
-			for (const auto &attribute : attributes->v) {
-				if (attribute.type() == mtpc_starGiftAttributeModel) {
-					(void)Api::FromTL(session, attribute.c_starGiftAttributeModel());
-				} else if (attribute.type() == mtpc_starGiftAttributePattern) {
-					(void)Api::FromTL(session, attribute.c_starGiftAttributePattern());
-				}
-			}
-		}).send();
+			MTP_int(0),
+			MTPPeer(),
+			MTP_int(0));
+	}();
+	using Flag = MTPDmessageService::Flag;
+	const auto message = MTP_messageService(
+		MTP_flags(Flag::f_from_id | Flag::f_out),
+		MTP_int(0),
+		peerToMTP(session->userPeerId()),
+		peerToMTP(record.recipient),
+		MTPPeer(),
+		MTPMessageReplyHeader(),
+		MTP_int(gift.date),
+		action,
+		MTPMessageReactions(),
+		MTPint());
+	const auto item = history->makeMessage(
+		id,
+		message.c_messageService(),
+		MessageFlag::Local | MessageFlag::HistoryEntry);
+	if (newlySent) {
+		history->addNewLocalMessage(item);
 	}
 }
 
@@ -404,9 +413,108 @@ void State::refreshResources() {
 }
 
 [[nodiscard]] auto Find(State &state, Data::SavedStarGiftId id) {
-	return ranges::find_if(state.records, [&](const Record &record) {
-		return record.gift.manageId == id;
-	});
+	const auto index = state.recordIndex.find(id.userMessageId());
+	return (index != end(state.recordIndex)
+		&& state.records[index->second].gift.manageId == id)
+		? begin(state.records) + index->second
+		: end(state.records);
+}
+
+void State::refreshGift(Data::SavedStarGiftId id) {
+	if (!enabled.current()) {
+		return;
+	}
+	loadRecords();
+	const auto found = Find(*this, id);
+	if (found == end(records) || found->resourcesRequested
+		|| (found->resourceAttempt
+			&& crl::now() - found->resourceAttempt < kResourceRetryDelay)) {
+		return;
+	}
+	found->resourcesRequested = true;
+	found->resourceAttempt = crl::now();
+	if (!found->gift.info.unique) {
+		if (catalogRefreshed) {
+			return;
+		}
+		catalogRefreshed = true;
+	}
+	resourceQueue.push_back(id);
+	requestNextResource();
+}
+
+void State::requestNextResource() {
+	while (enabled.current() && resourcesLoading < 2 && !resourceQueue.empty()) {
+		const auto id = resourceQueue.front();
+		resourceQueue.erase(begin(resourceQueue));
+		const auto found = Find(*this, id);
+		if (found == end(records)) {
+			continue;
+		}
+		++resourcesLoading;
+		const auto finish = [=](bool success) {
+			--resourcesLoading;
+			if (!success) {
+				const auto found = Find(*this, id);
+				if (found != end(records)) {
+					found->resourcesRequested = false;
+				}
+			}
+			requestNextResource();
+		};
+		const auto failed = [=](const MTP::Error &) { finish(false); };
+		const auto &unique = found->gift.info.unique;
+		if (unique && !unique->slug.startsWith(u"Visual-")) {
+			resourceRequests.push_back(api.request(MTPpayments_GetUniqueStarGift(
+				MTP_string(unique->slug)
+			)).done([=](const MTPpayments_UniqueStarGift &result) {
+				const auto &source = result.data().vgift();
+				(void)Api::FromTL(session, source);
+				const auto found = Find(*this, id);
+				if (found != end(records)) {
+					found->source = source;
+					found->encodedSource = Encode(source);
+				}
+				finish(true);
+			}).fail(failed).send());
+		} else if (unique) {
+			using Flag = MTPpayments_GetResaleStarGifts::Flag;
+			resourceRequests.push_back(api.request(MTPpayments_GetResaleStarGifts(
+				MTP_flags(Flag::f_attributes_hash),
+				MTP_long(0),
+				MTP_long(unique->initialGiftId),
+				MTPVector<MTPStarGiftAttributeId>(),
+				MTP_string(QString()),
+				MTP_int(1)
+			)).done([=](const MTPpayments_ResaleStarGifts &result) {
+				const auto attributes = result.data().vattributes();
+				if (attributes) {
+					for (const auto &attribute : attributes->v) {
+						if (attribute.type() == mtpc_starGiftAttributeModel) {
+							(void)Api::FromTL(session, attribute.c_starGiftAttributeModel());
+						} else if (attribute.type() == mtpc_starGiftAttributePattern) {
+							(void)Api::FromTL(session, attribute.c_starGiftAttributePattern());
+						}
+					}
+				}
+				finish(true);
+			}).fail(failed).send());
+		} else {
+			resourceRequests.push_back(api.request(MTPpayments_GetStarGifts(
+				MTP_int(0)
+			)).done([=](const MTPpayments_StarGifts &result) {
+				if (result.type() == mtpc_payments_starGifts) {
+					for (const auto &source : result.c_payments_starGifts().vgifts().v) {
+						(void)Api::FromTL(session, source);
+					}
+				}
+				finish(true);
+			}).fail([=](const MTP::Error &) {
+				catalogRefreshed = false;
+				finish(false);
+			}).send());
+		}
+	}
 }
 
 }
@@ -440,16 +548,28 @@ rpl::producer<> Changes(not_null<Main::Session*> session) {
 bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 	auto &state = Get(session);
 	const auto previous = state.enabled.current();
+	if (previous == enabled) {
+		return true;
+	}
 	state.enabled = enabled;
 	if (!state.save()) {
 		state.enabled = previous;
 		return false;
 	}
 	if (enabled) {
-		state.refreshResources();
 		state.restoreMessages();
 	} else {
-		for (const auto &record : state.records) {
+		for (const auto request : state.resourceRequests) {
+			state.api.request(request).cancel();
+		}
+		state.resourceRequests.clear();
+		state.resourceQueue.clear();
+		state.resourcesLoading = 0;
+		state.catalogRefreshed = false;
+		state.restoredPeers.clear();
+		for (auto &record : state.records) {
+			record.resourcesRequested = false;
+			record.resourceAttempt = 0;
 			state.removeMessage(record);
 		}
 	}
@@ -491,11 +611,15 @@ std::vector<Data::SavedStarGift> Gifts(
 	if (!state.enabled.current()) {
 		return result;
 	}
+	state.loadRecords();
 	for (const auto &record : state.records) {
 		if (record.recipient == peer->id
 			&& (peer->isSelf() || !record.gift.hidden)
 			&& (!pinnedOnly || (record.gift.pinned && !record.gift.hidden))) {
 			result.push_back(record.gift);
+			if (pinnedOnly) {
+				state.refreshGift(record.gift.manageId);
+			}
 		}
 	}
 	return result;
@@ -510,10 +634,25 @@ std::optional<Data::SavedStarGift> FindGift(
 		not_null<Main::Session*> session,
 		Data::SavedStarGiftId id) {
 	auto &state = Get(session);
+	if (state.enabled.current()) {
+		state.loadRecords();
+	}
 	const auto found = Find(state, id);
 	return (state.enabled.current() && found != end(state.records))
 		? std::make_optional(found->gift)
 		: std::nullopt;
+}
+
+PeerId GiftRecipient(
+		not_null<Main::Session*> session,
+		Data::SavedStarGiftId id) {
+	auto &state = Get(session);
+	if (!state.enabled.current()) {
+		return PeerId();
+	}
+	state.loadRecords();
+	const auto found = Find(state, id);
+	return (found != end(state.records)) ? found->recipient : PeerId();
 }
 
 std::optional<Data::SavedStarGift> AddGift(
@@ -522,8 +661,12 @@ std::optional<Data::SavedStarGift> AddGift(
 		QString message,
 		bool anonymous) {
 	auto &state = Get(&recipient->session());
+	if (!state.enabled.current()) {
+		return {};
+	}
+	state.loadRecords();
 	const auto info = Api::FromTL(state.session, source);
-	if (!state.enabled.current() || !info
+	if (!info
 		|| state.records.size() + state.unreadableRecords.size() >= kMaxGifts) {
 		return {};
 	}
@@ -534,12 +677,18 @@ std::optional<Data::SavedStarGift> AddGift(
 		std::move(message),
 		base::unixtime::now(),
 		anonymous);
-	state.records.push_back({ source, gift, recipient->id });
+	state.records.push_back({ source, gift, recipient->id, Encode(source) });
 	if (!state.save()) {
 		state.records.pop_back();
 		return {};
 	}
-	state.restoreMessages();
+	state.recordIndex.emplace(
+		gift.manageId.userMessageId(),
+		state.records.size() - 1);
+	state.restoreMessage(
+		state.records.back(),
+		state.session->data().history(recipient->id),
+		true);
 	state.notify();
 	return gift;
 }
@@ -550,7 +699,8 @@ bool SetPinned(
 		bool pinned) {
 	auto &state = Get(session);
 	const auto found = Find(state, id);
-	if (found == end(state.records) || !found->gift.info.unique) {
+	if (found == end(state.records) || !found->gift.info.unique
+		|| found->recipient != session->userPeerId()) {
 		return false;
 	}
 	const auto count = ranges::count_if(state.records, [&](const Record &record) {
@@ -578,7 +728,8 @@ bool SetHidden(
 		bool hidden) {
 	auto &state = Get(session);
 	const auto found = Find(state, id);
-	if (found == end(state.records)) {
+	if (found == end(state.records)
+		|| found->recipient != session->userPeerId()) {
 		return false;
 	}
 	const auto previous = found->gift;
@@ -607,15 +758,31 @@ bool RemoveGift(not_null<Main::Session*> session, Data::SavedStarGiftId id) {
 		state.records.insert(begin(state.records) + index, record);
 		return false;
 	}
+	state.recordIndex.erase(id.userMessageId());
+	for (auto &entry : state.recordIndex) {
+		if (entry.second > index) {
+			--entry.second;
+		}
+	}
 	state.removeMessage(record);
 	state.notify();
 	return true;
 }
 
 void RestoreMessages(not_null<Main::Session*> session) {
-	auto &state = Get(session);
-	state.refreshResources();
-	state.restoreMessages();
+	(void)Get(session);
+}
+
+void RestoreHistory(not_null<History*> history) {
+	Get(&history->session()).restoreMessages(history);
+}
+
+void RefreshGift(
+		not_null<Main::Session*> session,
+		Data::SavedStarGiftId id) {
+	if (IsClientMsgId(id.userMessageId())) {
+		Get(session).refreshGift(id);
+	}
 }
 
 }

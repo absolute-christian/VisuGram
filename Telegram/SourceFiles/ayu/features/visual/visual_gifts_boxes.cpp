@@ -1,10 +1,10 @@
 #include "ayu/features/visual/visual_gifts.h"
 
 #include "api/api_premium.h"
-#include "base/random.h"
 #include "boxes/star_gift_box.h"
 #include "boxes/star_gift_cover_box.h"
 #include "chat_helpers/compose/compose_show.h"
+#include "data/data_credits.h"
 #include "data/data_session.h"
 #include "data/data_user.h"
 #include "info/peer_gifts/info_peer_gifts_common.h"
@@ -16,6 +16,7 @@
 #include "settings/settings_common.h"
 #include "ui/boxes/boost_box.h"
 #include "ui/layers/generic_box.h"
+#include "ui/text/format_values.h"
 #include "ui/vertical_list.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/checkbox.h"
@@ -33,7 +34,6 @@
 namespace Ayu::Visual {
 namespace {
 
-using Info::PeerGifts::GiftDescriptor;
 using Info::PeerGifts::GiftTypeStars;
 
 void StorageError(not_null<Window::SessionController*> window) {
@@ -66,16 +66,11 @@ void AddCover(
 	}
 }
 
-void ShowCatalogPage(
-	not_null<Window::SessionController*> window,
-	not_null<PeerData*> recipient,
-	uint64 giftId,
-	QString collectionTitle = QString());
-
 void ShowSendBox(
 		not_null<Window::SessionController*> window,
 		not_null<PeerData*> recipient,
-		MTPStarGift source) {
+		MTPStarGift source,
+		bool forceTon = false) {
 	const auto gift = Api::FromTL(&window->session(), source);
 	if (!gift) {
 		return;
@@ -99,16 +94,20 @@ void ShowSendBox(
 			tr::lng_gift_send_anonymous(tr::now),
 			false,
 			st::defaultCheckbox), st::boxRowPadding);
-		if (!gift->unique && (gift->resellCount || gift->upgradable)) {
-			box->addButton(TextValue(
-				u"Collectible variants"_q,
-				u"Коллекционные варианты"_q), [=] {
-				ShowCatalogPage(window, recipient, gift->id, gift->resellTitle);
-			});
-		}
 		box->addButton(tr::lng_gift_send_button(
 			lt_cost,
-			rpl::single(u"∞"_q)), [=] {
+			rpl::single([&] {
+				auto price = gift->unique
+					? (forceTon
+						? Data::UniqueGiftResaleTon(*gift->unique)
+						: Data::UniqueGiftResaleAsked(*gift->unique))
+					: CreditsAmount(gift->stars);
+				if (price.value() < 0) {
+					price = CreditsAmount();
+				}
+				return (price.ton() ? u"TON "_q : u"★ "_q)
+					+ Lang::FormatCreditsAmountDecimal(price);
+			}())), [=] {
 			if (!Enabled(&window->session())) {
 				box->closeBox();
 				return;
@@ -195,189 +194,6 @@ void ImportGift(
 	}));
 }
 
-class CatalogState final {
-public:
-	explicit CatalogState(not_null<Main::Session*> session) : api(&session->mtp()) {
-	}
-
-	MTP::Sender api;
-	std::map<uint64, MTPStarGift> sources;
-	Ui::GiftsDescriptor gifts;
-	rpl::event_stream<> updated;
-	rpl::variable<QString> status;
-	QString offset;
-	bool loading = false;
-	bool allLoaded = false;
-	bool samplesRequested = false;
-
-};
-
-void ShowCatalogPage(
-		not_null<Window::SessionController*> window,
-		not_null<PeerData*> recipient,
-		uint64 giftId,
-		QString collectionTitle) {
-	window->show(Box([=](not_null<Ui::GenericBox*> box) {
-		box->setWidth(st::boxWideWidth);
-		box->setStyle(st::giftBox);
-		box->setTitle(TextValue(
-			giftId ? u"Visual collectibles"_q : u"Visual gifts"_q,
-			giftId ? u"Визуальные коллекционные подарки"_q : u"Визуальные подарки"_q));
-		const auto session = &window->session();
-		const auto state = box->lifetime().make_state<CatalogState>(session);
-		state->status = tr::lng_contacts_loading(tr::now);
-		box->addRow(object_ptr<Ui::FlatLabel>(
-			box,
-			state->status.value(),
-			st::boxLabel), st::boxRowPadding);
-		const auto append = [=](const QVector<MTPStarGift> &sources) {
-			for (const auto &source : sources) {
-				if (const auto gift = Api::FromTL(session, source)) {
-					if (!state->sources.emplace(gift->id, source).second) {
-						continue;
-					}
-					state->gifts.list.push_back(GiftTypeStars{ .info = *gift });
-				}
-			}
-			state->status = state->gifts.list.empty()
-				? Text(u"No public gifts found."_q, u"Публичные подарки не найдены."_q)
-				: QString();
-			state->updated.fire({});
-		};
-		const auto failed = [=](const MTP::Error &error) {
-			state->loading = false;
-			state->status = Text(
-				u"Could not load gifts. Use Retry."_q,
-				u"Не удалось загрузить подарки. Нажмите «Повторить»."_q);
-			MTP::ShowErrorFallback(window->uiShow(), error);
-		};
-		const auto load = [=] {
-			if (state->loading
-				|| (state->allLoaded && (!giftId || state->samplesRequested))) {
-				return;
-			}
-			state->loading = true;
-			if (giftId) {
-				if (!state->samplesRequested) {
-					state->samplesRequested = true;
-					state->api.request(MTPpayments_GetStarGiftUpgradePreview(
-						MTP_long(giftId)
-					)).done([=](const MTPpayments_StarGiftUpgradePreview &result) {
-						auto models = QVector<MTPStarGiftAttribute>();
-						auto patterns = QVector<MTPStarGiftAttribute>();
-						auto backdrops = QVector<MTPStarGiftAttribute>();
-						for (const auto &attribute : result.data().vsample_attributes().v) {
-							switch (attribute.type()) {
-							case mtpc_starGiftAttributeModel: models.push_back(attribute); break;
-							case mtpc_starGiftAttributePattern: patterns.push_back(attribute); break;
-							case mtpc_starGiftAttributeBackdrop: backdrops.push_back(attribute); break;
-							}
-						}
-						if (models.empty() || patterns.empty() || backdrops.empty()) {
-							return;
-						}
-						auto samples = QVector<MTPStarGift>();
-						const auto title = collectionTitle.isEmpty()
-							? Text(u"Visual collectible"_q, u"Визуальный коллекционный подарок"_q)
-							: collectionTitle;
-						for (auto i = 0; i != models.size(); ++i) {
-							const auto id = base::RandomValue<uint64>() & 0x7FFFFFFFFFFFFFFFULL;
-							using Flag = MTPDstarGiftUnique::Flag;
-							samples.push_back(MTP_starGiftUnique(
-								MTP_flags(Flag::f_owner_id),
-								MTP_long(id),
-								MTP_long(giftId),
-								MTP_string(title),
-								MTP_string(u"Visual-"_q + QString::number(id)),
-								MTP_int(i + 1),
-								peerToMTP(recipient->id),
-								MTP_string(QString()),
-								MTP_string(QString()),
-								MTP_vector<MTPStarGiftAttribute>({
-									models[i],
-									patterns[i % patterns.size()],
-									backdrops[i % backdrops.size()],
-								}),
-								MTP_int(1),
-								MTP_int(1),
-								MTP_string(QString()),
-								MTPVector<MTPStarsAmount>(),
-								MTPPeer(),
-								MTP_long(0),
-								MTP_string(QString()),
-								MTP_long(0),
-								MTPPeer(),
-								MTPPeerColor(),
-								MTPPeer(),
-								MTP_int(0),
-								MTP_int(0)));
-						}
-						append(samples);
-					}).fail([=](const MTP::Error &) {
-						state->samplesRequested = false;
-					}).send();
-				}
-				state->api.request(MTPpayments_GetResaleStarGifts(
-					MTP_flags(0),
-					MTP_long(0),
-					MTP_long(giftId),
-					MTPVector<MTPStarGiftAttributeId>(),
-					MTP_string(state->offset),
-					MTP_int(50)
-				)).done([=](const MTPpayments_ResaleStarGifts &result) {
-					state->loading = false;
-					const auto &data = result.data();
-					session->data().processUsers(data.vusers());
-					session->data().processChats(data.vchats());
-					state->offset = qs(data.vnext_offset().value_or_empty());
-					state->allLoaded = state->offset.isEmpty();
-					append(data.vgifts().v);
-				}).fail(failed).send();
-			} else {
-				state->api.request(MTPpayments_GetStarGifts(
-					MTP_int(0)
-				)).done([=](const MTPpayments_StarGifts &result) {
-					state->loading = false;
-					state->allLoaded = true;
-					if (result.type() == mtpc_payments_starGifts) {
-						const auto &data = result.c_payments_starGifts();
-						session->data().processUsers(data.vusers());
-						session->data().processChats(data.vchats());
-						append(data.vgifts().v);
-					}
-				}).fail(failed).send();
-			}
-		};
-		box->addRow(Ui::MakeGiftsList({
-			.window = window,
-			.peer = recipient,
-			.gifts = rpl::single(rpl::empty) | rpl::then(
-				state->updated.events()
-			) | rpl::map([=] { return state->gifts; }),
-			.loadMore = load,
-			.handler = [=](GiftDescriptor descriptor) {
-				if (!Enabled(session)) {
-					box->closeBox();
-					return;
-				}
-				const auto gift = std::get_if<GiftTypeStars>(&descriptor);
-				const auto source = gift
-					? state->sources.find(gift->info.id)
-					: end(state->sources);
-				if (source != end(state->sources)) {
-					ShowSendBox(window, recipient, source->second);
-				}
-			},
-		}));
-		box->addButton(TextValue(u"Public NFT link"_q, u"Ссылка на NFT"_q), [=] {
-			ImportGift(window, recipient);
-		});
-		box->addButton(TextValue(u"Retry / More"_q, u"Повторить / Ещё"_q), load);
-		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
-		load();
-	}));
-}
-
 void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 	window->show(Box([=](not_null<Ui::GenericBox*> box) {
 		const auto session = &window->session();
@@ -437,7 +253,73 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 void ShowCatalog(
 		not_null<Window::SessionController*> window,
 		not_null<PeerData*> recipient) {
-	ShowCatalogPage(window, recipient, 0);
+	Ui::ShowStarGiftBox(window, recipient);
+}
+
+void ShowPurchase(
+		not_null<Window::SessionController*> window,
+		not_null<PeerData*> recipient,
+		const Data::StarGift &gift,
+		bool forceTon) {
+	if (!Enabled(&window->session())) {
+		return;
+	}
+	window->show(Box([=](not_null<Ui::GenericBox*> box) {
+		box->setWidth(st::boxWideWidth);
+		box->setTitle(tr::lng_gift_send_title());
+		AddLabel(box, tr::lng_contacts_loading(tr::now));
+		const auto session = &window->session();
+		const auto sender = box->lifetime().make_state<MTP::Sender>(
+			&session->mtp());
+		const auto open = [=](const MTPStarGift &source) {
+			if (!Enabled(session)) {
+				box->closeBox();
+				return;
+			}
+			box->closeBox();
+			ShowSendBox(window, recipient, source, forceTon);
+		};
+		const auto failed = [=](const MTP::Error &error) {
+			MTP::ShowErrorFallback(window->uiShow(), error);
+			box->closeBox();
+		};
+		if (gift.unique) {
+			sender->request(MTPpayments_GetUniqueStarGift(
+				MTP_string(gift.unique->slug)
+			)).done([=](const MTPpayments_UniqueStarGift &result) {
+				session->data().processUsers(result.data().vusers());
+				open(result.data().vgift());
+			}).fail(failed).send();
+		} else {
+			sender->request(MTPpayments_GetStarGifts(
+				MTP_int(0)
+			)).done([=](const MTPpayments_StarGifts &result) {
+				if (result.type() == mtpc_payments_starGifts) {
+					const auto &data = result.c_payments_starGifts();
+					session->data().processUsers(data.vusers());
+					session->data().processChats(data.vchats());
+					for (const auto &source : data.vgifts().v) {
+						if (source.type() == mtpc_starGift
+							&& uint64(source.c_starGift().vid().v) == gift.id) {
+							open(source);
+							return;
+						}
+					}
+				}
+				window->showToast(Text(
+					u"Gift is no longer in the catalog."_q,
+					u"Подарка больше нет в каталоге."_q));
+				box->closeBox();
+			}).fail(failed).send();
+		}
+		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+	}));
+}
+
+void ShowImport(
+		not_null<Window::SessionController*> window,
+		not_null<PeerData*> recipient) {
+	ImportGift(window, recipient);
 }
 
 void ShowLocalGift(
@@ -447,19 +329,23 @@ void ShowLocalGift(
 		box->setWidth(st::boxWideWidth);
 		box->setStyle(st::giftBox);
 		box->setTitle(TextValue(u"Visual gift"_q, u"Визуальный подарок"_q));
-		AddCover(box, window->session().user(), gift.info);
-		if (const auto &unique = gift.info.unique) {
-			AddLabel(box,
-				Text(u"Model: "_q, u"Модель: "_q) + unique->model.name
-				+ '\n' + Text(u"Backdrop: "_q, u"Фон: "_q) + unique->backdrop.name
-				+ '\n' + Text(u"Symbol: "_q, u"Узор: "_q) + unique->pattern.name);
+		const auto recipientId = GiftRecipient(&window->session(), gift.manageId);
+		const auto recipient = recipientId
+			? window->session().data().peer(recipientId)
+			: window->session().user();
+		RefreshGift(&window->session(), gift.manageId);
+		AddCover(box, recipient, gift.info);
+		if (!gift.mine) {
+			AddLabel(box, Text(
+				u"Sent to "_q + recipient->name(),
+				u"Отправлен "_q + recipient->name()));
 		}
 		if (!gift.message.empty()) {
 			AddLabel(box, gift.message.text);
 		}
 		const auto session = &window->session();
 		const auto id = gift.manageId;
-		if (gift.info.unique) {
+		if (gift.mine && gift.info.unique) {
 			box->addButton(TextValue(
 				gift.pinned ? u"Unpin from profile"_q : u"Pin to profile"_q,
 				gift.pinned ? u"Открепить от профиля"_q : u"Закрепить в профиле"_q), [=] {
@@ -472,15 +358,17 @@ void ShowLocalGift(
 				box->closeBox();
 			});
 		}
-		box->addButton(TextValue(
-			gift.hidden ? u"Show on profile"_q : u"Hide from profile"_q,
-			gift.hidden ? u"Показать в профиле"_q : u"Скрыть из профиля"_q), [=] {
-			if (!SetHidden(session, id, !gift.hidden)) {
-				StorageError(window);
-				return;
-			}
-			box->closeBox();
-		});
+		if (gift.mine) {
+			box->addButton(TextValue(
+				gift.hidden ? u"Show on profile"_q : u"Hide from profile"_q,
+				gift.hidden ? u"Показать в профиле"_q : u"Скрыть из профиля"_q), [=] {
+				if (!SetHidden(session, id, !gift.hidden)) {
+					StorageError(window);
+					return;
+				}
+				box->closeBox();
+			});
+		}
 		box->addButton(TextValue(u"Delete visual gift"_q, u"Удалить визуальный подарок"_q), [=] {
 			if (!RemoveGift(session, id)) {
 				StorageError(window);

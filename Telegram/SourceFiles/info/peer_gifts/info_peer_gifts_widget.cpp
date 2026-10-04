@@ -902,6 +902,7 @@ void InnerWidget::validateButtons() {
 		view.index = index;
 		view.manageId = manageId;
 		view.giftId = giftId;
+		Ayu::Visual::RefreshGift(&_peer->session(), manageId);
 		if (_addingToCollectionId) {
 			view.button->toggleSelected(
 				_inCollection.contains(manageId),

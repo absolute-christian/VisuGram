@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/peer_gifts/info_peer_gifts_common.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_global_privacy.h"
 #include "api/api_premium.h"
 #include "base/unixtime.h"
@@ -113,6 +115,9 @@ rpl::producer<std::vector<GiftTypeStars>> GiftsStars(
 	static auto Map = base::flat_map<not_null<Main::Session*>, Session>();
 
 	const auto filtered = [=](std::vector<GiftTypeStars> list) {
+		if (Ayu::Visual::Enabled(session)) {
+			return list;
+		}
 		list.erase(ranges::remove_if(list, [&](const GiftTypeStars &gift) {
 			return !AllowedToSend(gift, peer);
 		}), end(list));

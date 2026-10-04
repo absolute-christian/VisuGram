@@ -353,6 +353,9 @@ void PremiumGift::draw(
 		Painter &p,
 		const PaintContext &context,
 		const QRect &geometry) {
+	Ayu::Visual::RefreshGift(
+		&_parent->history()->session(),
+		Data::SavedStarGiftId::User(_parent->data()->id));
 	if (_sticker) {
 		_sticker->draw(p, context, geometry);
 	} else {

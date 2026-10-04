@@ -1786,6 +1786,14 @@ void GiftBox(
 	box->setNoContentMargin(true);
 	box->setCustomCornersFilling(RectPart::FullTop);
 	box->addButton(tr::lng_create_group_back(), [=] { box->closeBox(); });
+	const auto visual = Ayu::Visual::Enabled(&window->session());
+	if (visual) {
+		box->addLeftButton(Ayu::Visual::TextValue(
+			u"NFT link"_q,
+			u"Ссылка на NFT"_q), [=] {
+			Ayu::Visual::ShowImport(window, peer);
+		});
+	}
 
 	window->session().credits().load();
 
@@ -1802,13 +1810,13 @@ void GiftBox(
 	const auto disallowedTypes = user
 		? user->disallowedGiftTypes()
 		: Type::Premium;
-	const auto premiumDisallowed = peer->isSelf()
+	const auto premiumDisallowed = visual || peer->isSelf()
 		|| (disallowedTypes & Type::Premium);
-	const auto limitedDisallowed = !peer->isSelf()
+	const auto limitedDisallowed = !visual && !peer->isSelf()
 		&& (disallowedTypes & Type::Limited);
-	const auto unlimitedDisallowed = !peer->isSelf()
+	const auto unlimitedDisallowed = !visual && !peer->isSelf()
 		&& (disallowedTypes & Type::Unlimited);
-	const auto uniqueDisallowed = !peer->isSelf()
+	const auto uniqueDisallowed = !visual && !peer->isSelf()
 		&& (disallowedTypes & Type::Unique);
 	const auto allStarsDisallowed = limitedDisallowed
 		&& unlimitedDisallowed
@@ -2377,10 +2385,6 @@ void ChooseStarGiftRecipient(
 void ShowStarGiftBox(
 		not_null<Window::SessionController*> controller,
 		not_null<PeerData*> peer) {
-	if (Ayu::Visual::Enabled(&controller->session())) {
-		Ayu::Visual::ShowCatalog(controller, peer);
-		return;
-	}
 	if (controller->showFrozenError()) {
 		return;
 	}
@@ -2420,6 +2424,7 @@ void ShowStarGiftBox(
 	i->second = Session{ .peer = peer };
 
 	const auto weak = base::make_weak(controller);
+	const auto visual = Ayu::Visual::Enabled(session);
 	const auto checkReady = [=] {
 		auto &entry = Map[session];
 		if (!entry.ready()) {
@@ -2428,7 +2433,7 @@ void ShowStarGiftBox(
 		auto was = std::move(entry);
 		entry = Session();
 		if (const auto strong = weak.get()) {
-			if (const auto user = peer->asUser(); user && !user->isSelf()) {
+			if (const auto user = peer->asUser(); user && !user->isSelf() && !visual) {
 				using Type = Api::DisallowedGiftType;
 				const auto disallowedTypes = user->disallowedGiftTypes();
 				const auto premium = (disallowedTypes & Type::Premium)
@@ -2450,7 +2455,7 @@ void ShowStarGiftBox(
 	};
 
 	const auto user = peer->asUser();
-	if (user && !user->isSelf()) {
+	if (user && !user->isSelf() && !visual) {
 		GiftsPremium(
 			session,
 			peer
@@ -2498,6 +2503,11 @@ void ShowStarGiftBox(
 		checkReady();
 	}, i->second.lifetime);
 
+	if (visual) {
+		i->second.myReady = true;
+		checkReady();
+		return;
+	}
 	Data::MyUniqueGiftsSlice(
 		session,
 		Data::MyUniqueType::OnlyOwned
@@ -4479,11 +4489,18 @@ void DefaultGiftHandler(
 		not_null<Window::SessionController*> window,
 		not_null<DefaultGiftHandlerState*> state,
 		Info::PeerGifts::GiftDescriptor descriptor) {
-	if (Ayu::Visual::Enabled(&window->session())) {
-		Ayu::Visual::ShowCatalog(window, state->peer);
+	const auto star = std::get_if<GiftTypeStars>(&descriptor);
+	const auto visual = Ayu::Visual::Enabled(&window->session());
+	if (visual && star && (!star->resale || star->info.unique)) {
+		Ayu::Visual::ShowPurchase(
+			window,
+			state->peer,
+			star->info,
+			star->forceTon);
+		return;
+	} else if (visual && !star) {
 		return;
 	}
-	const auto star = std::get_if<GiftTypeStars>(&descriptor);
 	const auto send = crl::guard(&state->guard, [=] {
 		window->show(Box(
 			SendGiftBox,
@@ -4679,9 +4696,7 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		const auto count = int(state->list.size());
 
 		auto &buttons = state->buttons;
-		if (buttons.size() < count) {
-			buttons.resize(count);
-		}
+		buttons.resize(count);
 		auto &validated = state->validated;
 		validated.resize(count);
 
@@ -4767,10 +4782,10 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 				}
 			}
 		}
-		const auto till = std::min(int(buttons.size()), rowTill * perRow);
-		for (auto i = count; i < till; ++i) {
-			if (const auto button = buttons[i].get()) {
-				button->hide();
+		for (auto i = 0; i != int(buttons.size()); ++i) {
+			if (i < first || i >= last) {
+				buttons[i].reset();
+				validated[i] = false;
 			}
 		}
 

@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "history/history.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "history/view/history_view_element.h"
 #include "history/view/history_view_item_preview.h"
 #include "history/view/history_view_translate_tracker.h"
@@ -4176,6 +4178,7 @@ void History::insertMessageToBlocks(not_null<HistoryItem*> item) {
 }
 
 void History::checkLocalMessages() {
+	Ayu::Visual::RestoreHistory(this);
 	if (isEmpty() && (!loadedAtTop() || !loadedAtBottom())) {
 		return;
 	}

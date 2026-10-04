@@ -2,6 +2,8 @@
 
 #include "data/data_star_gift.h"
 
+class History;
+
 namespace Main {
 class Session;
 }
@@ -41,6 +43,9 @@ namespace Ayu::Visual {
 [[nodiscard]] std::optional<Data::SavedStarGift> FindGift(
 	not_null<Main::Session*> session,
 	Data::SavedStarGiftId id);
+[[nodiscard]] PeerId GiftRecipient(
+	not_null<Main::Session*> session,
+	Data::SavedStarGiftId id);
 [[nodiscard]] std::optional<Data::SavedStarGift> AddGift(
 	not_null<PeerData*> recipient,
 	const MTPStarGift &gift,
@@ -58,10 +63,22 @@ namespace Ayu::Visual {
 	not_null<Main::Session*> session,
 	Data::SavedStarGiftId id);
 void RestoreMessages(not_null<Main::Session*> session);
+void RestoreHistory(not_null<History*> history);
+void RefreshGift(
+	not_null<Main::Session*> session,
+	Data::SavedStarGiftId id);
 void ShowProfileEditor(
 	not_null<Window::SessionController*> window,
 	bool editPhone);
 void ShowCatalog(
+	not_null<Window::SessionController*> window,
+	not_null<PeerData*> recipient);
+void ShowPurchase(
+	not_null<Window::SessionController*> window,
+	not_null<PeerData*> recipient,
+	const Data::StarGift &gift,
+	bool forceTon = false);
+void ShowImport(
 	not_null<Window::SessionController*> window,
 	not_null<PeerData*> recipient);
 void ShowLocalGift(
