@@ -154,8 +154,8 @@ private:
 		info.unique->ownerName = QString();
 		info.unique->ownerAddress = QString();
 		info.unique->hostId = PeerId();
-		info.unique->starsForResale = -1;
-		info.unique->nanoTonForResale = -1;
+		info.unique->starsForResale = 0;
+		info.unique->nanoTonForResale = 0;
 		info.unique->onlyAcceptTon = false;
 		info.unique->originalDetails = {
 			.senderId = anonymous ? PeerId() : session->userPeerId(),
