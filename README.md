@@ -17,7 +17,7 @@ Visual gifts and profile values exist only in this client. They do not change ac
 
 Download the Windows x64 ZIP from this repository's Releases, extract it into its own folder and run `VisuGram.exe`. Keep the bundled `TelegramForcePortable` directory beside the executable. Account data is stored in this folder; do not upload or commit it.
 
-The first cloud build is being validated. Preview releases are Debug builds; successful compilation alone does not confirm runtime behavior. [Feature guide](docs/visual-mode.md).
+A [Windows x64 Debug preview](https://github.com/absolute-christian/VisuGram/releases/tag/visual-preview-5) has successfully compiled and been packaged. Login, gifts, animations and persistence still need manual testing. [Feature guide](docs/visual-mode.md).
 
 ## Cloud build
 
