@@ -625,8 +625,15 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 	if (object.value(u"sender_id"_q).toString() == u"0" && previous != end(serverVersions)) {
 		object.insert(u"sender_id"_q, previous->second.value(u"sender_id"_q));
 	}
-	if (id.isEmpty() || object == serverVersions[id]) {
+	if (id.isEmpty()) {
 		return;
+	}
+	if (object == serverVersions[id]) {
+		const auto found = ranges::find(records, id, &Record::serverId);
+		if (found != end(records)
+			&& found->active == object.value(u"active"_q).toBool(true)) {
+			return;
+		}
 	}
 	const auto source = Decode(object.value(u"source"_q).toString().toLatin1());
 	const auto parsed = source ? Api::FromTL(session, *source) : std::nullopt;
@@ -658,7 +665,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		? CreditsAmount(amount / 1'000'000'000, amount % 1'000'000'000, CreditsType::Ton)
 		: CreditsAmount(amount);
 	auto found = ranges::find(records, id, &Record::serverId);
-	if (found == end(records) && records.size() >= kMaxGifts) {
+	if (found == end(records) && records.size() >= 2 * kMaxGifts) {
 		for (auto i = records.size(); i != 0; ) {
 			--i;
 			const auto &record = records[i];
@@ -679,7 +686,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		removeMessage(*found);
 		*found = Record{ *source, gift, recipient, Encode(*source), price, sender, id, active };
 	} else {
-		if (records.size() >= kMaxGifts) {
+		if (records.size() >= 3 * kMaxGifts) {
 			return;
 		}
 		recordIndex.emplace(gift.manageId.userMessageId(), records.size());
