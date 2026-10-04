@@ -1,6 +1,0 @@
-FROM python:3.12-slim
-WORKDIR /app
-COPY app.py /app/app.py
-ENV VISUGRAM_BIND=0.0.0.0 VISUGRAM_DATABASE=/data/visugram.sqlite3 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-EXPOSE 8080
-CMD ["python", "/app/app.py"]
