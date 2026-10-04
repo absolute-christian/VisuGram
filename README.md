@@ -24,6 +24,8 @@ Visual changes are local by default. An optional shared server synchronizes them
 
 Enable **My Stars → Visual Stars** to use local gifts. Visual numbers and usernames are configured in **Edit Profile**.
 
+For shared profiles and collectible gifts, set **Edit Profile → Visual sync server** to `https://visugram-api-production.up.railway.app`. Each participant needs to connect once. See the [data policy draft](server/privacy.md) before connecting.
+
 The current release is an experimental Debug preview; runtime behavior has not yet been manually verified.
 
 ## Documentation
