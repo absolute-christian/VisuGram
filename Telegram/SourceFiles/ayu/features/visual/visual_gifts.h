@@ -1,6 +1,7 @@
 #pragma once
 
 #include "data/data_star_gift.h"
+#include "data/data_types.h"
 #include <QtCore/QJsonObject>
 
 class History;
@@ -45,6 +46,15 @@ void SendGift(not_null<PeerData*> recipient, const MTPStarGift &source,
 	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
 void ManageGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
 	bool pinned, bool hidden, Fn<void(QString)> done);
+void UpdateGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
+	QJsonObject changes, Fn<void(QString)> done);
+void TransferGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
+	not_null<PeerData*> recipient, Fn<void(QString)> done);
+void BuyGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
+	Fn<void(QString)> done);
+[[nodiscard]] bool GiftWorn(
+	not_null<Main::Session*> session, Data::SavedStarGiftId id);
+[[nodiscard]] EmojiStatusId WornStatus(not_null<const PeerData*> peer);
 void ShowCollectible(not_null<Window::SessionController*> window,
 	not_null<PeerData*> peer, QString entity);
 void ShowSyncSettings(not_null<Window::SessionController*> window);

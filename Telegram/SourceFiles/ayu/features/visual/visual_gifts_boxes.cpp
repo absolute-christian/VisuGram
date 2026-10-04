@@ -2,33 +2,45 @@
 
 #include "api/api_premium.h"
 #include "base/unixtime.h"
+#include "boxes/gift_premium_box.h"
+#include "boxes/peer_list_controllers.h"
 #include "boxes/star_gift_box.h"
 #include "boxes/star_gift_cover_box.h"
 #include "chat_helpers/compose/compose_show.h"
 #include "data/data_credits.h"
 #include "data/data_session.h"
 #include "data/data_user.h"
+#include "history/view/controls/history_view_suggest_options.h"
 #include "info/peer_gifts/info_peer_gifts_common.h"
 #include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "main/main_app_config.h"
 #include "mainwindow.h"
 #include "mtproto/mtproto_response.h"
 #include "mtproto/sender.h"
 #include "settings/settings_common.h"
+#include "settings/settings_credits_graphics.h"
 #include "ui/boxes/boost_box.h"
 #include "ui/boxes/collectible_info_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "ui/dynamic_thumbnails.h"
 #include "ui/layers/generic_box.h"
+#include "ui/text/custom_emoji_helper.h"
 #include "ui/text/format_values.h"
 #include "ui/vertical_list.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/labels.h"
+#include "ui/widgets/popup_menu.h"
+#include "ui/text/text_utilities.h"
 #include "window/window_session_controller.h"
 #include "styles/style_boxes.h"
+#include "styles/style_chat.h"
 #include "styles/style_credits.h"
+#include "styles/style_giveaway.h"
 #include "styles/style_layers.h"
+#include "styles/style_menu_icons.h"
 #include "styles/style_settings.h"
 
 #include <QtCore/QRegularExpression>
@@ -39,6 +51,143 @@ namespace Ayu::Visual {
 namespace {
 
 using Info::PeerGifts::GiftTypeStars;
+
+void AddLabel(not_null<Ui::GenericBox*> box, QString text);
+
+class GiftRecipientController final : public ContactsBoxController {
+public:
+	GiftRecipientController(
+		not_null<Main::Session*> session,
+		Fn<void(not_null<PeerData*>)> choose)
+	: ContactsBoxController(session)
+	, _choose(std::move(choose)) {
+	}
+
+	void rowClicked(not_null<PeerListRow*> row) override {
+		_choose(row->peer());
+	}
+
+protected:
+	void prepareViewHook() override {
+		delegate()->peerListSetTitle(tr::lng_gift_transfer_choose());
+	}
+
+	std::unique_ptr<PeerListRow> createRow(not_null<UserData*> user) override {
+		return (user->isSelf() || user->isBot() || user->isServiceUser()
+			|| user->isInaccessible())
+			? nullptr : ContactsBoxController::createRow(user);
+	}
+
+private:
+	Fn<void(not_null<PeerData*>)> _choose;
+
+};
+
+void ShowGiftTransfer(
+		not_null<Window::SessionController*> window,
+		Data::SavedStarGift gift) {
+	const auto choose = [=](not_null<PeerData*> recipient) {
+		window->show(Box([=](not_null<Ui::GenericBox*> box) {
+			box->setStyle(st::giveawayGiftCodeBox);
+			box->setWidth(st::boxWideWidth);
+			Ui::AddUniqueGiftCover(box->verticalLayout(),
+				rpl::single(Ui::UniqueGiftCover{ *gift.info.unique }), {});
+			const auto busy = box->lifetime().make_state<bool>(false);
+			Ui::ConfirmBox(box, {
+				.text = tr::lng_gift_transfer_sure(
+					lt_name,
+					rpl::single(tr::bold(Data::UniqueGiftName(*gift.info.unique))),
+					lt_recipient,
+					rpl::single(tr::bold(recipient->shortName())),
+					tr::marked),
+				.confirmed = [=] {
+					if (std::exchange(*busy, true)) {
+						return;
+					}
+					TransferGift(&window->session(), gift.manageId, recipient,
+						crl::guard(box, [=](QString error) {
+							*busy = false;
+							if (!error.isEmpty()) {
+								window->showToast(SyncError(error));
+								return;
+							}
+							window->hideLayer();
+							window->showPeerHistory(recipient);
+						}));
+				},
+				.confirmText = tr::lng_gift_transfer_button(),
+			});
+			AddTransferGiftTable(window->uiShow(), box->verticalLayout(), gift.info.unique);
+		}), Ui::LayerOption::KeepOther);
+	};
+	window->show(Box<PeerListBox>(
+		std::make_unique<GiftRecipientController>(&window->session(), choose),
+		[](not_null<PeerListBox*> box) {
+			box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+		}), Ui::LayerOption::KeepOther);
+}
+
+void ShowGiftSale(
+		not_null<Window::SessionController*> window,
+		Data::SavedStarGift gift) {
+	window->show(Box([=](not_null<Ui::GenericBox*> box) {
+		const auto session = &window->session();
+		const auto &config = session->appConfig();
+		box->setStyle(st::upgradeGiftBox);
+		box->setWidth(st::boxWideWidth);
+		box->addTopButton(st::boxTitleClose, [=] { box->closeBox(); });
+		const auto ton = box->lifetime().make_state<rpl::variable<bool>>(
+			gift.info.unique->onlyAcceptTon);
+		box->setTitle(rpl::conditional(ton->value(),
+			tr::lng_gift_sell_title_ton(), tr::lng_gift_sell_title()));
+		auto initial = Data::UniqueGiftResaleAsked(*gift.info.unique);
+		if (initial.value() <= 0) {
+			initial = CreditsAmount(config.giftResaleStarsMin());
+		}
+		auto input = HistoryView::AddStarsTonPriceInput(box->verticalLayout(), {
+			.session = session,
+			.showTon = ton->value(),
+			.price = initial,
+			.starsMin = config.giftResaleStarsMin(),
+			.starsMax = config.giftResaleStarsMax(),
+			.nanoTonMin = config.giftResaleNanoTonMin(),
+			.nanoTonMax = config.giftResaleNanoTonMax(),
+		});
+		box->setFocusCallback(std::move(input.focusCallback));
+		Ui::AddSkip(box->verticalLayout());
+		const auto onlyTon = box->addRow(object_ptr<Ui::Checkbox>(box,
+			tr::lng_gift_sell_only_ton(tr::now), ton->current(), st::defaultCheckbox));
+		*ton = onlyTon->checkedValue();
+		AddLabel(box, Text(
+			u"The gift will be offered to other VisuGram users at this visual price."_q,
+			u"Подарок будет выставлен для других пользователей VisuGram по этой визуальной цене."_q));
+		const auto busy = box->lifetime().make_state<bool>(false);
+		box->addButton(tr::lng_settings_save(), [=, compute = std::move(input.computeResult)] {
+			const auto price = compute();
+			if (*busy || !price || price->value() <= 0) {
+				return;
+			}
+			*busy = true;
+			UpdateGift(session, gift.manageId, {
+				{ u"sale_price"_q, QString::number(price->ton()
+					? price->whole() * 1'000'000'000 + price->nano() : price->whole()) },
+				{ u"sale_currency"_q, price->ton() ? u"TON"_q : u"XTR"_q },
+			}, crl::guard(box, [=](QString error) {
+				*busy = false;
+				if (!error.isEmpty()) {
+					window->showToast(SyncError(error));
+					return;
+				}
+				window->hideLayer();
+				const auto updated = FindGift(session, gift.manageId);
+				if (updated) {
+					ShowLocalGift(window, *updated);
+				}
+			}));
+		});
+		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+	}), Ui::LayerOption::KeepOther);
+}
 
 void StorageError(not_null<Window::SessionController*> window) {
 	window->showToast(Text(
@@ -373,66 +522,149 @@ void ShowLocalGift(
 		not_null<Window::SessionController*> window,
 		const Data::SavedStarGift &gift) {
 	window->show(Box([=](not_null<Ui::GenericBox*> box) {
-		box->setWidth(st::boxWideWidth);
-		box->setStyle(st::giftBox);
-		box->setTitle(TextValue(u"Visual gift"_q, u"Визуальный подарок"_q));
-		const auto recipientId = GiftRecipient(&window->session(), gift.manageId);
-		const auto recipient = recipientId
-			? window->session().data().peer(recipientId)
-			: window->session().user();
-		RefreshGift(&window->session(), gift.manageId);
-		AddCover(box, recipient, gift.info);
-		if (!gift.mine) {
-			AddLabel(box, Text(
-				u"Sent to "_q + recipient->name(),
-				u"Отправлен "_q + recipient->name()));
-		}
-		if (!gift.message.empty()) {
-			AddLabel(box, gift.message.text);
-		}
 		const auto session = &window->session();
 		const auto id = gift.manageId;
+		const auto unique = gift.info.unique;
+		const auto canManage = gift.mine
+			&& (SyncServer(session).isEmpty() || IsSyncedGift(session, id));
+		box->setStyle(st::giveawayGiftCodeBox);
+		box->setWidth(st::boxWideWidth);
+		const auto recipientId = GiftRecipient(session, id);
+		const auto recipient = recipientId
+			? session->data().peer(recipientId) : session->user();
+		RefreshGift(session, id);
+		if (unique) {
+			box->setNoContentMargin(true);
+			Ui::AddUniqueGiftCover(box->verticalLayout(),
+				rpl::single(Ui::UniqueGiftCover{ *unique }), {
+					.numberText = rpl::single(u"#"_q
+						+ Lang::FormatCountDecimal(unique->number)),
+					.resalePrice = rpl::single(Data::UniqueGiftResaleAsked(*unique)),
+				});
+		} else {
+			AddCover(box, recipient, gift.info);
+		}
+		Ui::AddSkip(box->verticalLayout());
+		AddStarGiftTable(window->uiShow(), box->verticalLayout(), {},
+			Settings::SavedStarGiftEntry(recipient, gift), nullptr, nullptr,
+			false, nullptr);
+		Ui::AddSkip(box->verticalLayout());
 		const auto managing = box->lifetime().make_state<bool>(false);
-		const auto manage = [=](bool pinned, bool hidden) {
-			if (*managing) {
+		const auto updated = crl::guard(box, [=](QString error) {
+			*managing = false;
+			if (!error.isEmpty()) {
+				window->showToast(SyncError(error));
 				return;
 			}
-			*managing = true;
-			ManageGift(session, id, pinned, hidden, crl::guard(box, [=](QString error) {
-				*managing = false;
-				if (!error.isEmpty()) {
-					window->showToast(SyncError(error));
-					return;
-				}
-				box->closeBox();
-			}));
+			box->closeBox();
+			if (const auto current = FindGift(session, id)
+				; current && current->mine) {
+				ShowLocalGift(window, *current);
+			}
+		});
+		const auto update = [=](QJsonObject changes) {
+			if (!std::exchange(*managing, true)) {
+				UpdateGift(session, id, std::move(changes), updated);
+			}
 		};
-		if (gift.mine && gift.info.unique
-			&& (SyncServer(session).isEmpty() || IsSyncedGift(session, id))) {
-			box->addButton(TextValue(
-				gift.pinned ? u"Unpin from profile"_q : u"Pin to profile"_q,
-				gift.pinned ? u"Открепить от профиля"_q : u"Закрепить в профиле"_q), [=] {
-				manage(!gift.pinned, gift.pinned && gift.hidden);
-			});
-		}
-		if (gift.mine && (SyncServer(session).isEmpty() || IsSyncedGift(session, id))) {
-			box->addButton(TextValue(
-				gift.hidden ? u"Show on profile"_q : u"Hide from profile"_q,
-				gift.hidden ? u"Показать в профиле"_q : u"Скрыть из профиля"_q), [=] {
-				manage(gift.hidden && gift.pinned, !gift.hidden);
-			});
-		}
-		if (!IsSyncedGift(session, id)) {
-			box->addButton(TextValue(u"Delete visual gift"_q,
-				u"Удалить визуальный подарок"_q), [=] {
-				if (!RemoveGift(session, id)) {
-					StorageError(window);
-					return;
+		const auto manage = [=](bool pinned, bool hidden) {
+			if (!std::exchange(*managing, true)) {
+				ManageGift(session, id, pinned, hidden, updated);
+			}
+		};
+		if (canManage) {
+			const auto hint = gift.hidden
+				? tr::lng_gift_hidden_unique(tr::now)
+				: tr::lng_gift_visible_hint(tr::now);
+			const auto arrow = Ui::Text::IconEmoji(&st::textMoreIconEmoji);
+			const auto action = gift.hidden
+				? tr::lng_gift_visible_show_arrow(tr::now, lt_arrow, arrow, tr::marked)
+				: tr::lng_gift_visible_hide_arrow(tr::now, lt_arrow, arrow, tr::marked);
+			auto label = object_ptr<Ui::FlatLabel>(box,
+				rpl::single(TextWithEntities{ hint }.append(' ').append(
+					tr::link(action))), st::creditsBoxAboutDivider);
+			label->setClickHandlerFilter([=](const auto &, Qt::MouseButton button) {
+				if (button != Qt::LeftButton) {
+					return false;
 				}
-				box->closeBox();
+				manage(false, !gift.hidden);
+				return true;
+			});
+			box->addRow(std::move(label), style::al_top);
+		}
+		Settings::AddUniqueCloseMoreButton(box, {}, [=](not_null<Ui::PopupMenu*> menu) {
+			if (unique && canManage) {
+				menu->addAction(tr::lng_gift_transfer_button(tr::now), [=] {
+					ShowGiftTransfer(window, gift);
+				}, &st::menuIconReplace);
+				const auto worn = GiftWorn(session, id);
+				menu->addAction((worn ? tr::lng_gift_transfer_take_off
+					: tr::lng_gift_transfer_wear)(tr::now), [=] {
+					update({ { u"worn"_q, !worn } });
+				}, worn ? &st::menuIconNftTakeOff : &st::menuIconNftWear);
+				const auto listed = Data::UniqueGiftResaleAsked(*unique).value() > 0;
+				menu->addAction((listed ? tr::lng_gift_transfer_update
+					: tr::lng_gift_transfer_sell)(tr::now), [=] {
+					ShowGiftSale(window, gift);
+				}, &st::menuIconTagSell);
+				if (listed) {
+					menu->addAction(tr::lng_gift_transfer_unlist(tr::now), [=] {
+						update({ { u"listed"_q, false } });
+					}, &st::menuIconTagRemove);
+				}
+				menu->addAction((gift.pinned ? tr::lng_context_unpin_from_top
+					: tr::lng_context_pin_to_top)(tr::now), [=] {
+					manage(!gift.pinned, false);
+				}, gift.pinned ? &st::menuIconUnpin : &st::menuIconPin);
+			}
+			if (unique && !unique->slug.isEmpty()) {
+				menu->addAction(tr::lng_context_copy_link(tr::now), [=] {
+					TextUtilities::SetClipboardText({ session->createInternalLinkFull(
+						u"nft/"_q + unique->slug) });
+				}, &st::menuIconLink);
+			}
+			if (canManage) {
+				menu->addAction(Text(u"Delete visual gift"_q,
+					u"Удалить визуальный подарок"_q), [=] {
+					window->show(Ui::MakeConfirmBox({
+						.text = TextValue(u"Delete this visual gift?"_q,
+							u"Удалить этот визуальный подарок?"_q),
+						.confirmed = crl::guard(box, [=](Fn<void()> close) {
+							close();
+							update({ { u"removed"_q, true } });
+						}),
+						.confirmText = tr::lng_box_delete(),
+					}), Ui::LayerOption::KeepOther);
+				}, &st::menuIconDelete);
+			}
+		});
+		if (!gift.mine && unique && Data::UniqueGiftResaleAsked(*unique).value() > 0) {
+			const auto price = Data::UniqueGiftResaleAsked(*unique);
+			const auto cost = Lang::FormatCreditsAmountDecimal(price)
+				+ (price.ton() ? u" TON"_q : Text(u" Stars"_q, u" звёзд"_q));
+			box->addButton(tr::lng_gift_buy_resale_button(lt_cost, rpl::single(cost)), [=] {
+				window->show(Ui::MakeConfirmBox({
+					.text = tr::lng_gift_buy_resale_confirm_self(
+						lt_name, rpl::single(Data::UniqueGiftName(*unique)),
+						lt_price, rpl::single(cost)),
+					.confirmed = crl::guard(box, [=](Fn<void()> close) {
+						close();
+						if (!std::exchange(*managing, true)) {
+							BuyGift(session, id, crl::guard(box, [=](QString error) {
+								*managing = false;
+								if (!error.isEmpty()) {
+									window->showToast(SyncError(error));
+								} else {
+									window->hideLayer();
+									window->showPeerHistory(session->user());
+								}
+							}));
+						}
+					}),
+				}), Ui::LayerOption::KeepOther);
 			});
 		}
-		box->addButton(tr::lng_close(), [=] { box->closeBox(); });
+		box->addButton(tr::lng_box_ok(), [=] { box->closeBox(); });
 	}));
 }
 

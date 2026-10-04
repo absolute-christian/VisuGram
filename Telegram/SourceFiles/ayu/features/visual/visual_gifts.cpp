@@ -3,6 +3,8 @@
 #include "api/api_premium.h"
 #include "base/unixtime.h"
 #include "data/components/credits.h"
+#include "data/data_changes.h"
+#include "data/data_emoji_statuses.h"
 #include "data/data_session.h"
 #include "data/data_user.h"
 #include "history/history.h"
@@ -43,6 +45,7 @@ struct Record {
 	bool active = true;
 	bool resourcesRequested = false;
 	crl::time resourceAttempt = 0;
+	bool worn = false;
 };
 
 class State final {
@@ -50,6 +53,8 @@ public:
 	explicit State(not_null<Main::Session*> session);
 	[[nodiscard]] bool save();
 	void notify();
+	void updateWornStatuses();
+	void acceptMutation(QJsonObject object, bool newlySent = false);
 	void loadRecords();
 	void restoreMessages(History *only = nullptr);
 	void restoreMessage(
@@ -74,6 +79,8 @@ public:
 	QString phone;
 	QStringList usernames;
 	std::vector<Record> records;
+	std::map<PeerId, EmojiStatusId> wornStatuses;
+	bool wornStatusesDirty = false;
 	std::map<MsgId, size_t> recordIndex;
 	QJsonArray unreadableRecords;
 	QJsonArray pendingRecords;
@@ -147,6 +154,7 @@ private:
 		info.unique->hostId = PeerId();
 		info.unique->starsForResale = -1;
 		info.unique->nanoTonForResale = -1;
+		info.unique->onlyAcceptTon = false;
 		info.unique->originalDetails = {
 			.senderId = anonymous ? PeerId() : session->userPeerId(),
 			.recipientId = recipient,
@@ -224,6 +232,7 @@ void State::load() {
 }
 
 void State::loadRecords() {
+	const auto loaded = !pendingRecords.isEmpty() || !pendingServerGifts.isEmpty();
 	applyServerGifts();
 	const auto gifts = std::exchange(pendingRecords, QJsonArray());
 	for (const auto &value : gifts) {
@@ -264,6 +273,11 @@ void State::loadRecords() {
 					? CreditsType::Ton
 					: CreditsType::Stars),
 		});
+		records.back().worn = records.back().gift.mine
+			&& object.value(u"worn"_q).toBool();
+	}
+	if (loaded) {
+		updateWornStatuses();
 	}
 }
 
@@ -288,6 +302,7 @@ bool State::save() {
 			{ u"anonymous"_q, gift.anonymous },
 			{ u"pinned"_q, gift.pinned },
 			{ u"hidden"_q, gift.hidden },
+			{ u"worn"_q, record.worn },
 			{ u"price_whole"_q, QString::number(record.price.whole()) },
 			{ u"price_nano"_q, int(record.price.nano()) },
 			{ u"price_ton"_q, record.price.ton() },
@@ -317,7 +332,39 @@ bool State::save() {
 }
 
 void State::notify() {
+	updateWornStatuses();
 	changes.fire({});
+}
+
+void State::updateWornStatuses() {
+	wornStatusesDirty = false;
+	auto updated = std::map<PeerId, EmojiStatusId>();
+	if (enabled.current()) {
+		for (const auto &record : records) {
+			if (record.worn && record.active && !record.gift.hidden && record.gift.info.unique
+				&& (endpoint.isEmpty() || !record.serverId.isEmpty())) {
+				updated.emplace(record.recipient,
+					session->data().emojiStatuses().fromUniqueGift(*record.gift.info.unique));
+			}
+		}
+	}
+	auto changed = base::flat_set<PeerId>();
+	for (const auto &[peer, status] : wornStatuses) {
+		if (!updated.contains(peer) || updated.at(peer) != status) {
+			changed.emplace(peer);
+		}
+	}
+	for (const auto &[peer, status] : updated) {
+		if (!wornStatuses.contains(peer) || wornStatuses.at(peer) != status) {
+			changed.emplace(peer);
+		}
+	}
+	wornStatuses = std::move(updated);
+	for (const auto peerId : changed) {
+		if (const auto peer = session->data().peerLoaded(peerId)) {
+			session->changes().peerUpdated(peer, Data::PeerUpdate::Flag::EmojiStatus);
+		}
+	}
 }
 
 void State::removeMessage(const Record &record) {
@@ -475,8 +522,13 @@ void State::restoreMessage(
 	}
 }
 
-[[nodiscard]] State &Get(not_null<Main::Session*> session) {
+[[nodiscard]] auto &States() {
 	static auto states = std::map<Main::Session*, std::unique_ptr<State>>();
+	return states;
+}
+
+[[nodiscard]] State &Get(not_null<Main::Session*> session) {
+	auto &states = States();
 	const auto found = states.find(session);
 	if (found != end(states)) {
 		return *found->second;
@@ -484,7 +536,7 @@ void State::restoreMessage(
 	auto state = std::make_unique<State>(session);
 	const auto result = state.get();
 	states.emplace(session, std::move(state));
-	session->lifetime().add([session] { states.erase(session); });
+	session->lifetime().add([session] { States().erase(session); });
 	return *result;
 }
 
@@ -615,6 +667,30 @@ void State::view(not_null<PeerData*> peer) {
 			return;
 		}
 		remoteProfiles[peer->id] = std::move(object);
+		const auto visible = remoteProfiles[peer->id].value(u"gifts"_q).toArray();
+		auto wornId = QString();
+		for (const auto &value : visible) {
+			if (value.toObject().value(u"worn"_q).toBool()) {
+				wornId = value.toObject().value(u"id"_q).toString();
+				break;
+			}
+		}
+		for (auto &record : records) {
+			if (record.recipient == peer->id && !record.serverId.isEmpty()
+				&& record.serverId != wornId) {
+				record.worn = false;
+			}
+		}
+		for (const auto &value : visible) {
+			if (value.toObject().value(u"worn"_q).toBool()) {
+				acceptGift(value.toObject());
+				if (const auto worn = ranges::find(records,
+						value.toObject().value(u"id"_q).toString(), &Record::serverId)
+					; worn != end(records)) {
+					refreshGift(worn->gift.manageId);
+				}
+			}
+		}
 		notify();
 	});
 }
@@ -664,6 +740,15 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 	const auto price = ton
 		? CreditsAmount(amount / 1'000'000'000, amount % 1'000'000'000, CreditsType::Ton)
 		: CreditsAmount(amount);
+	if (gift.info.unique && object.value(u"listed"_q).toBool() && active) {
+		const auto sale = object.value(u"sale_price"_q).toString().toLongLong();
+		if (object.value(u"sale_currency"_q).toString() == u"TON") {
+			gift.info.unique->nanoTonForResale = sale;
+			gift.info.unique->onlyAcceptTon = true;
+		} else {
+			gift.info.unique->starsForResale = int(std::min<int64>(sale, INT_MAX));
+		}
+	}
 	auto found = ranges::find(records, id, &Record::serverId);
 	if (found == end(records) && records.size() >= 2 * kMaxGifts) {
 		for (auto i = records.size(); i != 0; ) {
@@ -693,11 +778,59 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		records.push_back({ *source, gift, recipient, Encode(*source), price, sender, id, active });
 	}
 	serverVersions[id] = std::move(object);
+	const auto current = ranges::find(records, id, &Record::serverId);
+	current->worn = active && serverVersions[id].value(u"worn"_q).toBool();
+	wornStatusesDirty = true;
 	if (enabled.current() && newlySent) {
 		const auto record = ranges::find(records, id, &Record::serverId);
 		const auto chat = recipient == session->userPeerId() ? sender : recipient;
 		restoreMessage(*record, session->data().history(chat), true);
 	}
+}
+
+void State::acceptMutation(QJsonObject object, bool newlySent) {
+	const auto accept = [&](QJsonObject value, bool sent) {
+		if (value.isEmpty()) {
+			return;
+		}
+		const auto id = value.value(u"id"_q).toString();
+		auto replaced = false;
+		for (auto i = 0; i != serverGifts.size(); ++i) {
+			if (serverGifts[i].toObject().value(u"id"_q).toString() == id) {
+				serverGifts[i] = value;
+				replaced = true;
+				break;
+			}
+		}
+		if (!replaced) {
+			serverGifts.push_back(value);
+		}
+		if (value.value(u"worn"_q).toBool()) {
+			for (auto &record : records) {
+				if (QString::number(peerToUser(record.recipient).bare)
+					== value.value(u"recipient_id"_q).toString()) {
+					record.worn = false;
+				}
+			}
+			for (auto i = 0; i != serverGifts.size(); ++i) {
+				auto other = serverGifts[i].toObject();
+				if (other.value(u"id"_q).toString() != id
+					&& other.value(u"recipient_id"_q) == value.value(u"recipient_id"_q)) {
+					other[u"worn"_q] = false;
+					serverGifts[i] = other;
+					serverVersions.erase(other.value(u"id"_q).toString());
+				}
+			}
+		}
+		acceptGift(std::move(value), sent);
+	};
+	accept(object.value(u"previous"_q).toObject(), false);
+	accept(object.value(u"gift"_q).toObject(), newlySent);
+	(void)save();
+	restoredPeers.clear();
+	restoreMessages();
+	notify();
+	sync();
 }
 
 void State::applyServerGifts() {
@@ -841,6 +974,21 @@ rpl::producer<bool> EnabledValue(not_null<Main::Session*> session) {
 
 rpl::producer<> Changes(not_null<Main::Session*> session) {
 	return Get(session).changes.events();
+}
+
+EmojiStatusId WornStatus(not_null<const PeerData*> peer) {
+	const auto state = States().find(&peer->session());
+	if (state == end(States()) || !state->second->enabled.current()) {
+		return {};
+	}
+	const auto found = state->second->wornStatuses.find(peer->id);
+	return found != end(state->second->wornStatuses) ? found->second : EmojiStatusId();
+}
+
+bool GiftWorn(not_null<Main::Session*> session, Data::SavedStarGiftId id) {
+	auto &state = Get(session);
+	const auto found = Find(state, id);
+	return found != end(state.records) && found->active && found->worn;
 }
 
 bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
@@ -1039,6 +1187,15 @@ QString SyncError(QString code) {
 	} else if (code == u"NOT_GIFT_OWNER") {
 		return Text(u"Only the recipient can manage this gift."_q,
 			u"Управлять подарком может только его получатель."_q);
+	} else if (code == u"PRICE_CHANGED") {
+		return Text(u"The seller changed the price. Reopen the gift."_q,
+			u"Продавец изменил цену. Откройте подарок заново."_q);
+	} else if (code == u"GIFT_NOT_LISTED") {
+		return Text(u"This gift is no longer for sale."_q,
+			u"Этот подарок больше не продаётся."_q);
+	} else if (code == u"INVALID_PRICE") {
+		return Text(u"Enter a valid gift price."_q,
+			u"Укажите допустимую цену подарка."_q);
 	} else if (code == u"STORAGE_ERROR") {
 		return Text(u"Could not save the local data."_q, u"Не удалось сохранить локальные данные."_q);
 	}
@@ -1163,25 +1320,113 @@ void ManageGift(
 		done(saved ? QString() : u"STORAGE_ERROR"_q);
 		return;
 	}
-	state.request(u"/v1/gifts/manage"_q, {
-		{ u"id"_q, found->serverId },
+	UpdateGift(session, id, {
 		{ u"pinned"_q, pinned },
 		{ u"hidden"_q, hidden },
+	}, std::move(done));
+}
+
+void UpdateGift(
+		not_null<Main::Session*> session,
+		Data::SavedStarGiftId id,
+		QJsonObject changes,
+		Fn<void(QString)> done) {
+	auto &state = Get(session);
+	const auto found = Find(state, id);
+	if (!state.enabled.current() || found == end(state.records)
+		|| !found->gift.mine || !found->active) {
+		done(u"NOT_GIFT_OWNER"_q);
+		return;
+	}
+	if (found->serverId.isEmpty()) {
+		if (changes.value(u"removed"_q).toBool()) {
+			done(RemoveGift(session, id) ? QString() : u"STORAGE_ERROR"_q);
+		} else if (changes.contains(u"worn"_q) && found->gift.info.unique) {
+			const auto previous = state.records;
+			const auto worn = changes.value(u"worn"_q).toBool();
+			for (auto &record : state.records) {
+				if (record.recipient == found->recipient && (worn || record.gift.manageId == id)) {
+					record.worn = worn && record.gift.manageId == id;
+					if (record.worn) {
+						record.gift.hidden = false;
+					}
+				}
+			}
+			const auto saved = state.save();
+			if (!saved) {
+				state.records = previous;
+			}
+			state.notify();
+			done(saved ? QString() : u"STORAGE_ERROR"_q);
+		} else {
+			done(u"SERVER_REQUIRED"_q);
+		}
+		return;
+	}
+	changes[u"id"_q] = found->serverId;
+	changes[u"operation_id"_q] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+	state.request(u"/v1/gifts/manage"_q, std::move(changes),
+		[&state, done = std::move(done)](QJsonObject object, QString error) {
+			if (error.isEmpty()) {
+				state.acceptMutation(std::move(object));
+			}
+			done(std::move(error));
+		});
+}
+
+void TransferGift(
+		not_null<Main::Session*> session,
+		Data::SavedStarGiftId id,
+		not_null<PeerData*> recipient,
+		Fn<void(QString)> done) {
+	auto &state = Get(session);
+	const auto found = Find(state, id);
+	if (!state.enabled.current() || found == end(state.records)
+		|| !found->active || !found->gift.mine || !found->gift.info.unique
+		|| !recipient->isUser() || recipient->isSelf()) {
+		done(u"NOT_GIFT_OWNER"_q);
+		return;
+	}
+	if (found->serverId.isEmpty()) {
+		done(u"SERVER_REQUIRED"_q);
+		return;
+	}
+	state.request(u"/v1/gifts/transfer"_q, {
+		{ u"id"_q, found->serverId },
+		{ u"recipient_id"_q, QString::number(peerToUser(recipient->id).bare) },
 		{ u"operation_id"_q, QUuid::createUuid().toString(QUuid::WithoutBraces) },
 	}, [&state, done = std::move(done)](QJsonObject object, QString error) {
 		if (error.isEmpty()) {
-			const auto gift = object.value(u"gift"_q).toObject();
-			for (auto i = 0; i != state.serverGifts.size(); ++i) {
-				if (state.serverGifts[i].toObject().value(u"id"_q) == gift.value(u"id"_q)) {
-					state.serverGifts[i] = gift;
-					break;
-				}
-			}
-			state.acceptGift(gift);
-			(void)state.save();
-			state.restoredPeers.clear();
-			state.restoreMessages();
-			state.notify();
+			state.acceptMutation(std::move(object), true);
+		}
+		done(std::move(error));
+	});
+}
+
+void BuyGift(
+		not_null<Main::Session*> session,
+		Data::SavedStarGiftId id,
+		Fn<void(QString)> done) {
+	auto &state = Get(session);
+	const auto found = Find(state, id);
+	if (!state.enabled.current() || found == end(state.records)
+		|| !found->active || found->gift.mine || !found->gift.info.unique) {
+		done(u"GIFT_NOT_LISTED"_q);
+		return;
+	}
+	const auto version = state.serverVersions.find(found->serverId);
+	if (version == end(state.serverVersions) || !version->second.value(u"listed"_q).toBool()) {
+		done(u"GIFT_NOT_LISTED"_q);
+		return;
+	}
+	state.request(u"/v1/gifts/buy"_q, {
+		{ u"id"_q, found->serverId },
+		{ u"sale_price"_q, version->second.value(u"sale_price"_q) },
+		{ u"sale_currency"_q, version->second.value(u"sale_currency"_q) },
+		{ u"operation_id"_q, QUuid::createUuid().toString(QUuid::WithoutBraces) },
+	}, [&state, done = std::move(done)](QJsonObject object, QString error) {
+		if (error.isEmpty()) {
+			state.acceptMutation(std::move(object), true);
 		}
 		done(std::move(error));
 	});
@@ -1228,12 +1473,16 @@ std::vector<Data::SavedStarGift> Gifts(
 					&& record.sender != state.session->userPeerId()
 					&& !visible.contains(record.serverId)) {
 					record.active = false;
+					state.wornStatusesDirty = true;
 				}
 			}
 			for (const auto &value : values) {
 				state.acceptGift(value.toObject());
 			}
 		}
+	}
+	if (state.wornStatusesDirty) {
+		state.updateWornStatuses();
 	}
 	for (const auto &record : state.records) {
 		if (record.recipient == peer->id && record.active
@@ -1401,12 +1650,15 @@ bool SetHidden(
 		return false;
 	}
 	const auto previous = found->gift;
+	const auto previouslyWorn = found->worn;
 	found->gift.hidden = hidden;
 	if (hidden) {
 		found->gift.pinned = false;
+		found->worn = false;
 	}
 	if (!state.save()) {
 		found->gift = previous;
+		found->worn = previouslyWorn;
 		return false;
 	}
 	state.notify();

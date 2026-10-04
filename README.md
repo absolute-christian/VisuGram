@@ -14,6 +14,7 @@ Visual changes are local by default. An optional shared server synchronizes them
 - Profile gift collection with hiding, deletion and up to six pinned collectibles.
 - Existing +888 collectible numbers and secondary NFT usernames with purchase information.
 - Shared visual profiles and gifts through a configurable sync server.
+- Collectible details with attributes, wear status, transfer and visual sale.
 - English and Russian labels for the added controls.
 
 ## Installation
