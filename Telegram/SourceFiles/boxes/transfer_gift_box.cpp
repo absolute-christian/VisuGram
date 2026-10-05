@@ -33,6 +33,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item.h"
 #include "history/history_item_components.h"
 #include "lang/lang_keys.h"
+#include "mainwindow.h"
 #include "main/main_app_config.h"
 #include "main/main_session.h"
 #include "payments/payments_checkout_process.h"
@@ -53,7 +54,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/empty_userpic.h"
 #include "ui/painter.h"
 #include "ui/vertical_list.h"
-#include "window/main_window.h"
 #include "window/window_session_controller.h"
 #include "styles/style_boxes.h" // peerListSingleRow.
 #include "styles/style_credits.h" // starIconEmoji.
