@@ -4,6 +4,9 @@ VisuGram Windows x64
 
 В этом апдейте:
 
+- Обновлена основа до AyuGram 7.2.9 вместе с исправлениями и новой библиотекой анимаций.
+- Исправлена ошибка компиляции Preview 9 и 10. Визуальные подарки адаптированы к новому API; комментарии используют штатное оформление AyuGram.
+
 - Общий сервер синхронизации встроен в приложение. Новые установки и обновления с пустым адресом подключаются автоматически.
 - Кнопка **«По умолчанию»** возвращает адрес общего сервера. Другой адрес или отключение сохраняются после перезапуска.
 - Короткие визуальные юзернеймы больше не отклоняются. Учитываются страницы поиска и статус Taken на Fragment; если цены нет, используется визуальная цена 7–10 TON.
@@ -23,6 +26,8 @@ Windows x64 Debug-сборка. Автоматического обновлен�
 ---
 
 Extract **VisuGram.exe** and **TelegramForcePortable** together, then launch the EXE.
+
+Updated to AyuGram 7.2.9 with its fixes and new animation library. Fixed the compilation failure in previews 9 and 10; visual gifts use the updated API and native comment rendering.
 
 The shared sync server is now built in. New installations and unconfigured upgrades connect automatically; **Default server** restores its address. Custom addresses and disconnection persist after restarting.
 

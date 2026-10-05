@@ -66,7 +66,7 @@ void RecentSharedMediaGifts::request(
 		combined.insert(end(combined), begin(gifts), end(gifts));
 		const auto limit = onlyPinnedToTop ? kMaxPinnedGifts : kMaxGifts;
 		if (combined.size() > limit) {
-			combined.resize(limit);
+			combined.erase(begin(combined) + limit, end(combined));
 		}
 		originalDone(std::move(combined));
 	};

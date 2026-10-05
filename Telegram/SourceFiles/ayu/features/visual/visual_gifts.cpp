@@ -481,7 +481,8 @@ void State::restoreMessage(
 			using Flag = MTPDmessageActionStarGiftUnique::Flag;
 			return MTP_messageActionStarGiftUnique(
 				MTP_flags(Flag::f_saved | Flag::f_peer
-					| (gift.anonymous ? Flag() : Flag::f_from_id)
+					| (gift.anonymous ? Flag::f_name_hidden : Flag::f_from_id)
+					| (gift.message.empty() ? Flag() : Flag::f_message)
 					| (record.price ? Flag::f_resale_amount : Flag())),
 				local,
 				MTP_int(0),
@@ -493,7 +494,10 @@ void State::restoreMessage(
 				MTP_int(0),
 				MTP_int(0),
 				MTP_long(0),
-				MTP_int(0));
+				MTP_int(0),
+				MTP_textWithEntities(
+					MTP_string(gift.message.text),
+					MTPVector<MTPMessageEntity>()));
 		}
 		using Flag = MTPDmessageActionStarGift::Flag;
 		return MTP_messageActionStarGift(

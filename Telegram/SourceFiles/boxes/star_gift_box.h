@@ -11,6 +11,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_peer_id.h"
 #include "data/data_star_gift.h"
 
+class QWidget;
 class UserData;
 
 namespace Api {
@@ -64,13 +65,31 @@ namespace Ui {
 class RpWidget;
 class PopupMenu;
 class GenericBox;
+class InputField;
 class Show;
 class VerticalLayout;
 
 [[nodiscard]] object_ptr<RpWidget> MakeVisualGiftPreview(
-	QWidget *parent,
+	not_null<QWidget*> parent,
 	not_null<PeerData*> recipient,
 	const Info::PeerGifts::GiftDescriptor &descriptor);
+
+[[nodiscard]] rpl::producer<bool> StarGiftMessageAllowedValue(
+	not_null<PeerData*> peer);
+
+[[nodiscard]] not_null<InputField*> AddStarGiftMessageField(
+	std::shared_ptr<ChatHelpers::Show> show,
+	not_null<VerticalLayout*> container,
+	not_null<QWidget*> outer,
+	rpl::producer<QString> placeholder,
+	QString current);
+
+[[nodiscard]] object_ptr<RpWidget> MakeUniqueGiftPreview(
+	not_null<QWidget*> parent,
+	not_null<PeerData*> recipient,
+	std::shared_ptr<Data::UniqueGift> gift,
+	TextWithEntities cost,
+	rpl::producer<UniqueGiftCoverMessage> message);
 
 void ChooseStarGiftRecipient(
 	not_null<Window::SessionController*> controller);
@@ -163,6 +182,9 @@ void ShowGiftTransferredToast(
 	not_null<PeerData*> to,
 	const Data::UniqueGift &gift);
 
+[[nodiscard]] bool ShowGiftErrorToast(
+	std::shared_ptr<Ui::Show> show,
+	const QString &type);
 [[nodiscard]] bool ShowGiftErrorToast(
 	std::shared_ptr<Ui::Show> show,
 	const MTP::Error &error);
