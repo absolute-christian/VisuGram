@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/transfer_gift_box.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "apiwrap.h"
 #include "api/api_cloud_password.h"
 #include "api/api_credits.h"
@@ -35,6 +37,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session.h"
 #include "payments/payments_checkout_process.h"
 #include "settings/settings_common.h"
+#include "ui/boxes/boost_box.h"
 #include "ui/boxes/confirm_box.h"
 #include "ui/controls/sub_tabs.h"
 #include "ui/controls/ton_common.h"
@@ -57,6 +60,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_info.h" // defaultSubTabs.
 #include "styles/style_layers.h" // boxLabel.
 #include "styles/style_settings.h"
+
+#include <QtCore/QUuid>
 
 namespace {
 
@@ -1160,6 +1165,8 @@ void ShowBuyResaleGiftBox(
 		bool forceTon,
 		not_null<PeerData*> to,
 		Fn<void(bool ok)> closeParentBox) {
+	const auto session = &show->session();
+	const auto visual = Ayu::Visual::Enabled(session);
 	const auto attempt = std::make_shared<ResaleGiftAttemptState>();
 	show->show(Box([=](not_null<Ui::GenericBox*> box) {
 		struct State {
@@ -1167,12 +1174,22 @@ void ShowBuyResaleGiftBox(
 			rpl::variable<bool> hideName;
 			rpl::variable<bool> messageAllowed;
 			std::shared_ptr<ResaleGiftAttemptState> attempt;
+			QString operation;
+			QString lastInput;
+			bool submitting = false;
 			bool confirmationOpen = false;
 		};
 		const auto state = box->lifetime().make_state<State>();
 		state->hideName = to->isSelf();
-		state->messageAllowed = Ui::StarGiftMessageAllowedValue(to);
+		state->messageAllowed = true;
+		if (!visual) {
+			state->messageAllowed = Ui::StarGiftMessageAllowedValue(to);
+		}
 		state->attempt = attempt;
+		Ayu::Visual::EnabledValue(session)
+		| rpl::skip(1) | rpl::on_next([=] {
+			box->closeBox();
+		}, box->lifetime());
 
 		box->setStyle(st::giftBox);
 		box->setWidth(st::boxWideWidth);
@@ -1266,6 +1283,50 @@ void ShowBuyResaleGiftBox(
 					rpl::single(to->shortName()))));
 
 		const auto button = box->addButton(rpl::single(QString()), [=] {
+			if (Ayu::Visual::Enabled(session) != visual || state->submitting) {
+				return;
+			}
+			if (visual) {
+				state->submitting = true;
+				const auto text = state->message.current().text;
+				const auto anonymous = state->hideName.current();
+				const auto input = text + (anonymous ? '1' : '0');
+				if (state->operation.isEmpty() || state->lastInput != input) {
+					state->operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
+					state->lastInput = input;
+				}
+				auto price = initiallyTon
+					? Data::UniqueGiftResaleTon(*gift)
+					: Data::UniqueGiftResaleAsked(*gift);
+				if (price.value() < 0) {
+					price = CreditsAmount();
+				}
+				Ayu::Visual::SendGift(
+					to,
+					gift->initialGiftId,
+					gift->slug,
+					text,
+					anonymous,
+					price,
+					state->operation,
+					crl::guard(box, [=](
+							std::optional<Data::SavedStarGift> saved,
+							QString error) {
+						state->submitting = false;
+						if (!saved) {
+							show->showToast(Ayu::Visual::SyncError(error));
+							return;
+						}
+						if (const auto window = show->resolveWindow()) {
+							window->hideLayer();
+							window->showPeerHistory(to,
+								Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
+							Ui::ShowResaleGiftBoughtToast(show, to, *gift);
+							Ui::StartFireworks(window->widget());
+						}
+					}));
+				return;
+			}
 			if (state->confirmationOpen || state->attempt->inFlight) {
 				return;
 			}

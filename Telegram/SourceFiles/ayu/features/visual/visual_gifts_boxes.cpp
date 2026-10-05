@@ -45,7 +45,6 @@
 
 #include <QtCore/QRegularExpression>
 #include <QtCore/QUrl>
-#include <QtCore/QUuid>
 
 namespace Ayu::Visual {
 namespace {
@@ -219,79 +218,6 @@ void AddCover(
 	}
 }
 
-void ShowSendBox(
-		not_null<Window::SessionController*> window,
-		not_null<PeerData*> recipient,
-		MTPStarGift source,
-		bool forceTon = false) {
-	const auto gift = Api::FromTL(&window->session(), source);
-	if (!gift) {
-		return;
-	}
-	window->show(Box([=](not_null<Ui::GenericBox*> box) {
-		box->setWidth(st::boxWideWidth);
-		box->setStyle(st::giftBox);
-		box->setTitle(TextValue(u"Visual gift"_q, u"Визуальный подарок"_q));
-		AddCover(box, recipient, *gift);
-		AddLabel(box, Text(
-			u"Visual gift for "_q + recipient->name(),
-			u"Визуальный подарок для "_q + recipient->name()));
-		const auto message = box->addRow(object_ptr<Ui::InputField>(
-			box,
-			st::giftBoxTextField,
-			Ui::InputField::Mode::MultiLine,
-			tr::lng_gift_send_message()), st::giftBoxTextPadding);
-		message->setMaxLength(255);
-		const auto anonymous = box->addRow(object_ptr<Ui::Checkbox>(
-			box,
-			tr::lng_gift_send_anonymous(tr::now),
-			false,
-			st::defaultCheckbox), st::boxRowPadding);
-		auto price = gift->unique
-			? (forceTon
-				? Data::UniqueGiftResaleTon(*gift->unique)
-				: Data::UniqueGiftResaleAsked(*gift->unique))
-			: CreditsAmount(gift->stars);
-		if (price.value() < 0) {
-			price = CreditsAmount();
-		}
-		const auto sending = box->lifetime().make_state<bool>(false);
-		const auto operation = box->lifetime().make_state<QString>();
-		const auto lastInput = box->lifetime().make_state<QString>();
-		box->addButton(tr::lng_gift_send_button(
-			lt_cost,
-			rpl::single((price.ton() ? u"TON "_q : u"★ "_q)
-				+ Lang::FormatCreditsAmountDecimal(price))), [=] {
-			if (*sending || !Enabled(&window->session())) {
-				return;
-			}
-			const auto text = message->getLastText();
-			const auto fingerprint = text + (anonymous->checked() ? '1' : '0');
-			if (operation->isEmpty() || *lastInput != fingerprint) {
-				*operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
-				*lastInput = fingerprint;
-			}
-			*sending = true;
-			SendGift(recipient, source, text, anonymous->checked(), price, *operation,
-				crl::guard(box, [=](std::optional<Data::SavedStarGift> saved, QString error) {
-					*sending = false;
-					if (!saved) {
-						window->showToast(SyncError(error));
-						return;
-					}
-					box->closeBox();
-					window->hideLayer();
-					window->showPeerHistory(recipient,
-						Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
-					window->showToast(Text(u"Visual gift sent"_q,
-						u"Визуальный подарок отправлен"_q));
-					Ui::StartFireworks(window->widget());
-				}));
-		});
-		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
-	}));
-}
-
 void ImportGift(
 		not_null<Window::SessionController*> window,
 		not_null<PeerData*> recipient) {
@@ -336,11 +262,17 @@ void ImportGift(
 				*loading = false;
 				const auto &data = result.data();
 				window->session().data().processUsers(data.vusers());
-				if (!Api::FromTL(&window->session(), data.vgift())) {
+				const auto gift = Api::FromTL(&window->session(), data.vgift());
+				if (!gift) {
 					field->showError();
 					return;
 				}
-				ShowSendBox(window, recipient, data.vgift());
+				if (!Enabled(&window->session())) {
+					box->closeBox();
+					return;
+				}
+				box->closeBox();
+				Ui::ShowStarGiftSendBox(window, recipient, *gift);
 			}).fail([=](const MTP::Error &error) {
 				*loading = false;
 				MTP::ShowErrorFallback(window->uiShow(), error);
@@ -465,72 +397,6 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 	}));
 }
 
-}
-
-void ShowCatalog(
-		not_null<Window::SessionController*> window,
-		not_null<PeerData*> recipient) {
-	Ui::ShowStarGiftBox(window, recipient);
-}
-
-void ShowPurchase(
-		not_null<Window::SessionController*> window,
-		not_null<PeerData*> recipient,
-		const Data::StarGift &gift,
-		bool forceTon) {
-	if (!Enabled(&window->session())) {
-		return;
-	}
-	window->show(Box([=](not_null<Ui::GenericBox*> box) {
-		box->setWidth(st::boxWideWidth);
-		box->setTitle(tr::lng_gift_send_title());
-		AddLabel(box, tr::lng_contacts_loading(tr::now));
-		const auto session = &window->session();
-		const auto sender = box->lifetime().make_state<MTP::Sender>(
-			&session->mtp());
-		const auto open = [=](const MTPStarGift &source) {
-			if (!Enabled(session)) {
-				box->closeBox();
-				return;
-			}
-			box->closeBox();
-			ShowSendBox(window, recipient, source, forceTon);
-		};
-		const auto failed = [=](const MTP::Error &error) {
-			MTP::ShowErrorFallback(window->uiShow(), error);
-			box->closeBox();
-		};
-		if (gift.unique) {
-			sender->request(MTPpayments_GetUniqueStarGift(
-				MTP_string(gift.unique->slug)
-			)).done([=](const MTPpayments_UniqueStarGift &result) {
-				session->data().processUsers(result.data().vusers());
-				open(result.data().vgift());
-			}).fail(failed).send();
-		} else {
-			sender->request(MTPpayments_GetStarGifts(
-				MTP_int(0)
-			)).done([=](const MTPpayments_StarGifts &result) {
-				if (result.type() == mtpc_payments_starGifts) {
-					const auto &data = result.c_payments_starGifts();
-					session->data().processUsers(data.vusers());
-					session->data().processChats(data.vchats());
-					for (const auto &source : data.vgifts().v) {
-						if (source.type() == mtpc_starGift
-							&& uint64(source.c_starGift().vid().v) == gift.id) {
-							open(source);
-							return;
-						}
-					}
-				}
-				window->showToast(Text(
-					u"Gift is no longer in the catalog."_q,
-					u"Подарка больше нет в каталоге."_q));
-				box->closeBox();
-			}).fail(failed).send();
-		}
-		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
-	}));
 }
 
 void ShowImport(

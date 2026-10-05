@@ -134,6 +134,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_settings.h"
 #include "styles/style_widgets.h"
 
+#include <QtCore/QUuid>
 #include <QtWidgets/QApplication>
 
 namespace Ui {
@@ -1197,6 +1198,10 @@ void SendGift(
 		std::shared_ptr<Api::PremiumGiftCodeOptions> api,
 		const GiftSendDetails &details,
 		Fn<void(Payments::CheckoutResult)> done) {
+	if (Ayu::Visual::Enabled(&window->session())) {
+		done(Payments::CheckoutResult::Cancelled);
+		return;
+	}
 	const auto processNonPanelPaymentFormFactory
 		= Payments::ProcessNonPanelPaymentFormFactory(window, done);
 	v::match(details.descriptor, [&](const GiftTypePremium &gift) {
@@ -1281,6 +1286,10 @@ void SendStarsFormRequest(
 		Fn<void(Payments::CheckoutResult, const MTPUpdates *)> done) {
 	using BalanceResult = Settings::SmallBalanceResult;
 	const auto session = &show->session();
+	if (Ayu::Visual::BlockGiftPayment(session, invoice)) {
+		done(Payments::CheckoutResult::Cancelled, nullptr);
+		return;
+	}
 	if (result == BalanceResult::Success
 		|| result == BalanceResult::Already) {
 		session->api().request(MTPpayments_SendStarsForm(
@@ -1750,6 +1759,10 @@ void GiftBox(
 	box->setCustomCornersFilling(RectPart::FullTop);
 	box->addButton(tr::lng_create_group_back(), [=] { box->closeBox(); });
 	const auto visual = Ayu::Visual::Enabled(&window->session());
+	Ayu::Visual::EnabledValue(&window->session())
+	| rpl::skip(1) | rpl::on_next([=] {
+		box->closeBox();
+	}, box->lifetime());
 	if (visual) {
 		box->addLeftButton(Ayu::Visual::TextValue(
 			u"NFT link"_q,
@@ -1758,7 +1771,9 @@ void GiftBox(
 		});
 	}
 
-	window->session().credits().load();
+	if (!visual) {
+		window->session().credits().load();
+	}
 
 	FillBg(box);
 
@@ -2570,6 +2585,9 @@ void ShowStarGiftBox(
 		}
 		auto was = std::move(entry);
 		entry = Session();
+		if (Ayu::Visual::Enabled(session) != visual) {
+			return;
+		}
 		if (const auto strong = weak.get()) {
 			if (const auto user = peer->asUser(); user && !user->isSelf() && !visual) {
 				using Type = Api::DisallowedGiftType;
@@ -2655,6 +2673,29 @@ void ShowStarGiftBox(
 		entry.myReady = true;
 		checkReady();
 	}, i->second.lifetime);
+}
+
+void ShowStarGiftSendBox(
+		not_null<Window::SessionController*> window,
+		not_null<PeerData*> peer,
+		const Data::StarGift &gift,
+		bool forceTon) {
+	if (gift.unique) {
+		ShowBuyResaleGiftBox(
+			window->uiShow(),
+			gift.unique,
+			forceTon,
+			peer,
+			[](bool) {});
+	} else {
+		window->show(Box(
+			SendGiftBox,
+			window,
+			peer,
+			nullptr,
+			GiftDescriptor(GiftTypeStars{ .info = gift }),
+			nullptr));
+	}
 }
 
 void AddWearGiftCover(
@@ -4412,6 +4453,10 @@ void SubmitStarsForm(
 		uint64 formId,
 		uint64 price,
 		Fn<void(Payments::CheckoutResult, const MTPUpdates *)> done) {
+	if (Ayu::Visual::BlockGiftPayment(&show->session(), invoice)) {
+		done(Payments::CheckoutResult::Cancelled, nullptr);
+		return;
+	}
 	const auto ready = [=](Settings::SmallBalanceResult result) {
 		SendStarsFormRequest(show, result, formId, invoice, done);
 	};
@@ -4428,6 +4473,10 @@ void SubmitTonForm(
 		uint64 formId,
 		CreditsAmount ton,
 		Fn<void(Payments::CheckoutResult, const MTPUpdates *)> done) {
+	if (Ayu::Visual::BlockGiftPayment(&show->session(), invoice)) {
+		done(Payments::CheckoutResult::Cancelled, nullptr);
+		return;
+	}
 	struct State {
 		rpl::lifetime lifetime;
 		bool completed = false;
@@ -4492,6 +4541,10 @@ void RequestOurForm(
 	const auto fail = [=](Payments::CheckoutResult failure) {
 		done(0, {}, failure);
 	};
+	if (Ayu::Visual::BlockGiftPayment(&show->session(), invoice)) {
+		fail(Payments::CheckoutResult::Cancelled);
+		return;
+	}
 	show->session().api().request(MTPpayments_GetPaymentForm(
 		MTP_flags(0),
 		invoice,
@@ -4667,7 +4720,7 @@ void DefaultGiftHandler(
 	const auto star = std::get_if<GiftTypeStars>(&descriptor);
 	const auto visual = Ayu::Visual::Enabled(&window->session());
 	if (visual && star && (!star->resale || star->info.unique)) {
-		Ayu::Visual::ShowPurchase(
+		ShowStarGiftSendBox(
 			window,
 			state->peer,
 			star->info,
@@ -4866,6 +4919,13 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 	const auto loadMore = args.loadMore;
 	const auto alreadySelected = args.selected;
 	const auto rebuild = [=] {
+		if (!raw->isVisible()) {
+			state->buttons.clear();
+			state->validated.clear();
+			state->firstVisible = -1;
+			state->lastVisible = -1;
+			return;
+		}
 		const auto width = st::boxWideWidth;
 		const auto padding = st::giftBoxPadding;
 		const auto available = width - padding.left() - padding.right();
@@ -4982,6 +5042,12 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		}
 	};
 
+	base::install_event_filter(raw, [=](not_null<QEvent*> event) {
+		if (event->type() == QEvent::Hide || event->type() == QEvent::Show) {
+			PostponeCall(raw, rebuild);
+		}
+		return base::EventFilterResult::Continue;
+	}, raw->lifetime());
 	state->visibleRange = raw->visibleRange();
 	state->visibleRange.value(
 	) | rpl::on_next(rebuild, raw->lifetime());
@@ -5031,19 +5097,20 @@ void SendGiftBox(
 		std::shared_ptr<Api::PremiumGiftCodeOptions> api,
 		const GiftDescriptor &descriptor,
 		rpl::producer<Data::GiftAuctionState> auctionState) {
+	const auto visual = Ayu::Visual::Enabled(&window->session());
 	const auto stars = std::get_if<GiftTypeStars>(&descriptor);
-	const auto auction = !!auctionState;
+	const auto auction = !visual && !!auctionState;
 	const auto limited = stars
 		&& (stars->info.limitedCount > stars->info.limitedLeft)
 		&& (stars->info.limitedLeft > 0);
-	const auto costToUpgrade = stars ? stars->info.starsToUpgrade : 0;
+	const auto costToUpgrade = (stars && !visual) ? stars->info.starsToUpgrade : 0;
 	const auto user = peer->asUser();
 	const auto disallowed = user
 		? user->disallowedGiftTypes()
 		: Api::DisallowedGiftTypes();
-	const auto disallowLimited = !peer->isSelf()
+	const auto disallowLimited = !visual && !peer->isSelf()
 		&& (disallowed & Api::DisallowedGiftType::Limited);
-	const auto disallowUnique = !peer->isSelf()
+	const auto disallowUnique = !visual && !peer->isSelf()
 		&& (disallowed & Api::DisallowedGiftType::Unique);
 	box->setStyle((limited && !auction) ? st::giftLimitedBox : st::giftBox);
 	box->setWidth(st::boxWideWidth);
@@ -5059,6 +5126,8 @@ void SendGiftBox(
 		rpl::variable<bool> messageAllowed;
 		std::shared_ptr<Data::DocumentMedia> media;
 		rpl::variable<Data::GiftAuctionState> auction;
+		QString operation;
+		QString lastInput;
 		bool submitting = false;
 	};
 	const auto state = box->lifetime().make_state<State>();
@@ -5070,7 +5139,14 @@ void SendGiftBox(
 		.randomId = base::RandomValue<uint64>(),
 		.upgraded = disallowLimited && (costToUpgrade > 0) && !disallowUnique,
 	};
-	state->messageAllowed = StarGiftMessageAllowedValue(peer);
+	state->messageAllowed = true;
+	if (!visual) {
+		state->messageAllowed = StarGiftMessageAllowedValue(peer);
+	}
+	Ayu::Visual::EnabledValue(session)
+	| rpl::skip(1) | rpl::on_next([=] {
+		box->closeBox();
+	}, box->lifetime());
 
 	auto cost = state->details.value(
 	) | rpl::map([](const GiftSendDetails &details) {
@@ -5243,9 +5319,7 @@ void SendGiftBox(
 	});
 
 	const auto button = box->addButton(rpl::single(QString()), [=] {
-		if (Ayu::Visual::Enabled(&window->session())) {
-			box->closeBox();
-			Ayu::Visual::ShowCatalog(window, peer);
+		if (Ayu::Visual::Enabled(session) != visual) {
 			return;
 		}
 		if (state->submitting) {
@@ -5257,6 +5331,41 @@ void SendGiftBox(
 			details.text = {};
 		}
 		const auto stars = std::get_if<GiftTypeStars>(&details.descriptor);
+		if (visual) {
+			if (!stars) {
+				state->submitting = false;
+				return;
+			}
+			const auto input = details.text.text
+				+ (details.anonymous ? '1' : '0');
+			if (state->operation.isEmpty() || state->lastInput != input) {
+				state->operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
+				state->lastInput = input;
+			}
+			Ayu::Visual::SendGift(
+				peer,
+				stars->info.id,
+				QString(),
+				details.text.text,
+				details.anonymous,
+				CreditsAmount(std::max(int64(0), stars->info.stars)),
+				state->operation,
+				crl::guard(box, [=](
+						std::optional<Data::SavedStarGift> saved,
+						QString error) {
+					state->submitting = false;
+					if (!saved) {
+						window->showToast(Ayu::Visual::SyncError(error));
+						return;
+					}
+					window->hideLayer();
+					window->showPeerHistory(peer,
+						Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
+					ShowSentToast(window, details.descriptor, details);
+					StartFireworks(window->widget());
+				}));
+			return;
+		}
 		if (stars && stars->info.auction()) {
 			const auto bidBox = window->show(MakeAuctionBidBox({
 				.peer = peer,
@@ -5334,7 +5443,7 @@ void SendGiftBox(
 			AddSoldLeftSlider(button, *stars);
 		}
 	}
-	if (stars && stars->info.auction()) {
+	if (!visual && stars && stars->info.auction()) {
 		SetAuctionButtonCountdownText(
 			button,
 			AuctionButtonCountdownType::Place,

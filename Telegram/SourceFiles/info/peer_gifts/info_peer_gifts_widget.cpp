@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/peer_gifts/info_peer_gifts_widget.h"
 
 #include "ayu/features/visual/visual_gifts.h"
+#include "base/event_filter.h"
 
 #include "api/api_credits.h"
 #include "api/api_hash.h"
@@ -361,6 +362,12 @@ InnerWidget::InnerWidget(
 , _api(&_peer->session().mtp())
 , _scrollAnimation([=] { updateScrollCallback(); }) {
 	_singleMin = _delegate.buttonSize();
+	base::install_event_filter(this, [=](not_null<QEvent*> event) {
+		if (event->type() == QEvent::Hide || event->type() == QEvent::Show) {
+			Ui::PostponeCall(this, [=] { validateButtons(); });
+		}
+		return base::EventFilterResult::Continue;
+	}, lifetime());
 	Ayu::Visual::Changes(&_peer->session()) | rpl::on_next([=] {
 		refreshLocalGifts();
 		refreshButtons();
@@ -618,7 +625,8 @@ void InnerWidget::visibleTopBottomUpdated(
 		int visibleTop,
 		int visibleBottom) {
 	const auto page = (visibleBottom - visibleTop);
-	if (visibleBottom + page * kPreloadPages >= height()) {
+	if (isVisible() && page > 0
+		&& visibleBottom + page * kPreloadPages >= height()) {
 		loadMore();
 	}
 	_visibleFrom = visibleTop;
@@ -769,6 +777,7 @@ void InnerWidget::refreshLocalGifts() {
 		return IsClientMsgId(entry.gift.manageId.userMessageId());
 	}), end(*_list));
 	const auto filter = _descriptor.current().filter;
+	auto local = std::vector<Entry>();
 	for (const auto &gift : Ayu::Visual::Gifts(_peer)) {
 		const auto unique = gift.info.unique != nullptr;
 		if ((unique && filter.skipUnique)
@@ -779,11 +788,16 @@ void InnerWidget::refreshLocalGifts() {
 			|| (gift.hidden && (filter.skipUnsaved || !_peer->isSelf()))) {
 			continue;
 		}
-		_list->insert(begin(*_list), Entry{
+		local.push_back(Entry{
 			.gift = gift,
 			.descriptor = DescriptorForGift(_peer, gift),
 		});
 	}
+	ranges::reverse(local);
+	_list->insert(
+		begin(*_list),
+		std::make_move_iterator(begin(local)),
+		std::make_move_iterator(end(local)));
 	_entries->total = std::max(0, _entries->total + int(_list->size()) - previous);
 }
 
@@ -839,6 +853,13 @@ std::unique_ptr<GiftButton> InnerWidget::createGiftButton() {
 }
 
 void InnerWidget::validateButtons() {
+	if (!isVisible()) {
+		_views.clear();
+		_viewsForWidth = 0;
+		_viewsFromRow = 0;
+		_viewsTillRow = 0;
+		return;
+	}
 	if (!_perRow) {
 		return;
 	}

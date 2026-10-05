@@ -26,6 +26,9 @@ namespace Ayu::Visual {
 	QString english,
 	QString russian);
 [[nodiscard]] bool Enabled(not_null<Main::Session*> session);
+[[nodiscard]] bool BlockGiftPayment(
+	not_null<Main::Session*> session,
+	const MTPInputInvoice &invoice);
 [[nodiscard]] rpl::producer<bool> EnabledValue(
 	not_null<Main::Session*> session);
 [[nodiscard]] rpl::producer<> Changes(not_null<Main::Session*> session);
@@ -43,6 +46,12 @@ namespace Ayu::Visual {
 void SaveProfile(not_null<Main::Session*> session,
 	QString phone, QStringList names, QString primary, Fn<void(QString)> done);
 void SendGift(not_null<PeerData*> recipient, const MTPStarGift &source,
+	QString message, bool anonymous, CreditsAmount price, QString operation,
+	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
+void RememberGiftSource(
+	not_null<Main::Session*> session,
+	const MTPStarGift &source);
+void SendGift(not_null<PeerData*> recipient, uint64 giftId, QString slug,
 	QString message, bool anonymous, CreditsAmount price, QString operation,
 	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
 void ManageGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
@@ -104,14 +113,6 @@ void RefreshGift(
 void ShowProfileEditor(
 	not_null<Window::SessionController*> window,
 	bool editPhone);
-void ShowCatalog(
-	not_null<Window::SessionController*> window,
-	not_null<PeerData*> recipient);
-void ShowPurchase(
-	not_null<Window::SessionController*> window,
-	not_null<PeerData*> recipient,
-	const Data::StarGift &gift,
-	bool forceTon = false);
 void ShowImport(
 	not_null<Window::SessionController*> window,
 	not_null<PeerData*> recipient);

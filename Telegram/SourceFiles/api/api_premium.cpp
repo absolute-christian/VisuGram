@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "api/api_premium.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "api/api_premium_option.h"
 #include "api/api_text_entities.h"
 #include "apiwrap.h"
@@ -836,7 +838,7 @@ rpl::producer<DocumentData*> RandomHelloStickerValue(
 std::optional<Data::StarGift> FromTL(
 		not_null<Main::Session*> session,
 		const MTPstarGift &gift) {
-	return gift.match([&](const MTPDstarGift &data) {
+	const auto result = gift.match([&](const MTPDstarGift &data) {
 		const auto document = session->data().processDocument(
 			data.vsticker());
 		const auto resellPrice = data.vresell_min_stars().value_or_empty();
@@ -991,6 +993,10 @@ std::optional<Data::StarGift> FromTL(
 		}
 		return std::make_optional(std::move(result));
 	});
+	if (result) {
+		Ayu::Visual::RememberGiftSource(session, gift);
+	}
+	return result;
 }
 
 std::optional<Data::SavedStarGift> FromTL(

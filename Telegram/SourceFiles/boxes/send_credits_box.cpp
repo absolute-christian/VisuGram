@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/send_credits_box.h"
 
+#include "ayu/features/visual/visual_gifts.h"
 #include "api/api_credits.h"
 #include "apiwrap.h"
 #include "core/ui_integration.h" // TextContext
@@ -394,6 +395,11 @@ void SendCreditsBox(
 		if (state->confirmButtonBusy.current()) {
 			return;
 		}
+		if (Ayu::Visual::BlockGiftPayment(session, form->inputInvoice)) {
+			box->closeBox();
+			sent(Settings::SmallBalanceResult::Cancelled);
+			return;
+		}
 		const auto show = box->uiShow();
 		const auto weak = base::make_weak(box.get());
 		state->confirmButtonBusy = true;
@@ -574,6 +580,10 @@ void SendStarsForm(
 		not_null<Main::Session*> session,
 		std::shared_ptr<Payments::CreditsFormData> data,
 		Fn<void(std::optional<QString>)> done) {
+	if (Ayu::Visual::BlockGiftPayment(session, data->inputInvoice)) {
+		done(u"VISUAL_MODE"_q);
+		return;
+	}
 	session->api().request(MTPpayments_SendStarsForm(
 		MTP_long(data->formId),
 		data->inputInvoice

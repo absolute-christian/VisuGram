@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "payments/payments_form.h"
 
+#include "ayu/features/visual/visual_gifts.h"
+
 #include "main/main_session.h"
 #include "data/data_channel.h"
 #include "data/data_session.h"
@@ -468,6 +470,10 @@ MTPInputInvoice Form::inputInvoice() const {
 }
 
 void Form::requestForm() {
+	if (Ayu::Visual::BlockGiftPayment(_session, inputInvoice())) {
+		_updates.fire(Error{ Error::Type::Form, u"VISUAL_MODE"_q });
+		return;
+	}
 	showProgress();
 	_api.request(MTPpayments_GetPaymentForm(
 		MTP_flags(MTPpayments_GetPaymentForm::Flag::f_theme_params),
@@ -919,6 +925,10 @@ void Form::fillSmartGlocalNativeMethod(QJsonObject object) {
 }
 
 void Form::submit() {
+	if (Ayu::Visual::BlockGiftPayment(_session, inputInvoice())) {
+		_updates.fire(Error{ Error::Type::Send, u"VISUAL_MODE"_q });
+		return;
+	}
 	Expects(_paymentMethod.newCredentials
 		|| (_paymentMethod.savedCredentialsIndex
 			< _paymentMethod.savedCredentials.size()));

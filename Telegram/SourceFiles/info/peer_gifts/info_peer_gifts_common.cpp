@@ -53,6 +53,7 @@ namespace Info::PeerGifts {
 namespace {
 
 constexpr auto kGiftsPerRow = 3;
+constexpr auto kMaxBadgeCache = 128;
 constexpr auto kCraftUnavailableOpacity = 0.5;
 
 [[nodiscard]] bool AllowedToSend(
@@ -429,7 +430,9 @@ void GiftButton::setDocument(not_null<DocumentData*> document) {
 					media.get(),
 					ChatHelpers::StickerLottieSize::InlineResults,
 					stickerSize(),
-					Lottie::Quality::High));
+					_lightweightAnimations
+						? Lottie::Quality::Default
+						: Lottie::Quality::High));
 		} else if (sticker->isWebm()) {
 			result = std::make_unique<HistoryView::WebmPlayer>(
 				media->owner()->location(),
@@ -1307,6 +1310,9 @@ not_null<StickerPremiumMark*> Delegate::hiddenMark() {
 }
 
 QImage Delegate::cachedBadge(const GiftBadge &badge) {
+	if (_badges.size() >= kMaxBadgeCache && !_badges.contains(badge)) {
+		_badges.clear();
+	}
 	auto &image = _badges[badge];
 	if (image.isNull()) {
 		image = ValidateRotatedBadge(badge, QMargins());

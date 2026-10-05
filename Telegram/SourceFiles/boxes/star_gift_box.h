@@ -102,6 +102,12 @@ void ShowStarGiftBox(
 	not_null<Window::SessionController*> controller,
 	not_null<PeerData*> peer);
 
+void ShowStarGiftSendBox(
+	not_null<Window::SessionController*> window,
+	not_null<PeerData*> peer,
+	const Data::StarGift &gift,
+	bool forceTon = false);
+
 void AddWearGiftCover(
 	not_null<VerticalLayout*> container,
 	const Data::UniqueGift &data,

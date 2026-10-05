@@ -4,35 +4,18 @@ VisuGram Windows x64
 
 В этом апдейте:
 
-- Обновлена основа до AyuGram 7.2.9 вместе с исправлениями и новой библиотекой анимаций.
-- Исправлена ошибка компиляции Preview 9 и 10. Визуальные подарки адаптированы к новому API; комментарии используют штатное оформление AyuGram.
+- Визуальные подарки покупаются через штатные окна Telegram: каталог, коллекционные подарки, комментарий и анонимность.
+- Убрано отдельное окно визуальной покупки и повторная загрузка данных при выборе подарка. Реальные платежи за подарки блокируются в визуальном режиме.
+- Скрытые списки освобождают карточки с анимациями и перестают подгружать новые страницы.
+- Ограничен кэш номерных лент. Анимации 60 fps в визуальных списках используют штатный режим 30 fps.
+- Синхронизация пропускает обновление неизменного профиля. Поиск подарков в большой коллекции больше не перебирает весь список для каждой карточки.
 
-- Общий сервер синхронизации встроен в приложение. Новые установки и обновления с пустым адресом подключаются автоматически.
-- Кнопка **«По умолчанию»** возвращает адрес общего сервера. Другой адрес или отключение сохраняются после перезапуска.
-- Короткие визуальные юзернеймы больше не отклоняются. Учитываются страницы поиска и статус Taken на Fragment; если цены нет, используется визуальная цена 7–10 TON.
-- Поддерживаются короткие коллекционные номера. Префикс **+888** закреплён в поле ввода и не удаляется.
-- Сохранение профиля ждёт завершения текущей синхронизации. Ошибки сервера, Fragment и неподтверждённого номера теперь различаются.
-- Подарок можно отправить незарегистрированному получателю: он останется локально. Зарегистрированному получателю подарок добавляется в общую БД.
-- Новые входящие подарки обновляют чат без взаимной отправки; в визуальном режиме синхронизация выполняется каждые пять секунд. Старые подарки не выдаются за новые при повторной синхронизации.
-- Полученные коллекционные подарки показывают номер на ленте вместо ошибочной надписи «Продаётся».
-- Номер телефона в профиле отображается с пробелами, как на Fragment.
-- В строке подарков профиля показывается не больше трёх значков.
-- Один юзернейм, номер или NFT может быть закреплён только за одним аккаунтом в общей БД.
-
-Визуальные профили и подарки видны пользователям одного сервера VisuGram. Реальные Stars, NFT и профиль Telegram не меняются.
-
-Windows x64 Debug-сборка. Автоматического обновления клиента пока нет.
+Основа — AyuGram 7.2.9. Визуальные подарки, номера и юзернеймы не меняют реальные активы Telegram. Автообновление клиента пока не доступно.
 
 ---
 
-Extract **VisuGram.exe** and **TelegramForcePortable** together, then launch the EXE.
+Extract **VisuGram.exe** and **TelegramForcePortable** into the same folder and launch the EXE.
 
-Updated to AyuGram 7.2.9 with its fixes and new animation library. Fixed the compilation failure in previews 9 and 10; visual gifts use the updated API and native comment rendering.
+Visual purchases now use Telegram's native catalog and confirmation screens, including comments and anonymity. Gift payments are blocked while visual mode is enabled. Hidden gift lists release their animation players and stop pagination. Serial ribbon caching is bounded; 60 fps animations in visual lists use the native 30 fps mode. Unchanged profiles no longer trigger UI refreshes, and server gift lookups use an index.
 
-The shared sync server is now built in. New installations and unconfigured upgrades connect automatically; **Default server** restores its address. Custom addresses and disconnection persist after restarting.
-
-Short visual usernames are supported. Fragment search pages and Taken usernames use a visual 7–10 TON price when no market price exists. Profile saves wait for the current sync; connection, lookup and number validation errors are shown separately. Short +888 numbers are supported with a fixed prefix. Collectibles remain unique per owner in the shared database.
-
-Gifts to unregistered recipients stay local; registered recipients receive them in the shared database. Profile gift previews are limited to three icons. New incoming gifts update the chat without a reciprocal gift, with five-second polling in visual mode and no replay of old gifts. Received collectibles show their serial number instead of an incorrect For Sale ribbon. Phone numbers use Fragment spacing.
-
-Visual changes do not change real Telegram payments or ownership. Windows x64 Debug preview; client auto-updates are not available yet.
+Based on AyuGram 7.2.9. Visual assets do not change real Telegram ownership. Client auto-updates are not available yet.

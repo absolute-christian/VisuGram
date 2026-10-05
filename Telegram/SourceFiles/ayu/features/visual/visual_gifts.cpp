@@ -25,12 +25,15 @@
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
 
+#include <deque>
+
 namespace Ayu::Visual {
 namespace {
 
 constexpr auto kVersion = 1;
 constexpr auto kMaxFileSize = 16 * 1024 * 1024;
 constexpr auto kMaxGifts = 1000;
+constexpr auto kMaxGiftSources = 128;
 constexpr auto kMaxPinned = 6;
 constexpr auto kResourceRetryDelay = crl::time(60 * 1000);
 constexpr auto kSyncInterval = crl::time(5 * 1000);
@@ -72,6 +75,8 @@ public:
 	void sync();
 	void view(not_null<PeerData*> peer);
 	void acceptGift(QJsonObject object, bool newlySent = false);
+	[[nodiscard]] std::vector<Record>::iterator findServerRecord(
+		const QString &id);
 	void applyServerGifts(
 		const QJsonArray &knownGifts = QJsonArray(),
 		bool notifyNew = false);
@@ -91,6 +96,8 @@ public:
 	QJsonArray pendingRecords;
 	std::vector<Data::SavedStarGiftId> resourceQueue;
 	std::vector<mtpRequestId> resourceRequests;
+	std::map<QString, MTPStarGift> giftSources;
+	std::deque<QString> giftSourceOrder;
 	base::flat_set<PeerId> restoredPeers;
 	int resourcesLoading = 0;
 	bool restoring = false;
@@ -105,6 +112,7 @@ public:
 	QJsonArray serverGifts;
 	QJsonArray pendingServerGifts;
 	std::map<QString, QJsonObject> serverVersions;
+	std::map<QString, MsgId> serverRecordIds;
 	std::map<PeerId, QJsonObject> remoteProfiles;
 	std::map<PeerId, crl::time> remoteAttempts;
 	base::flat_set<PeerId> remoteLoading;
@@ -640,6 +648,9 @@ void State::sync() {
 			cursor = previousCursor;
 			return;
 		}
+		if (ownProfile == previousProfile && serverGifts == previousGifts) {
+			return;
+		}
 		pendingServerGifts = serverGifts;
 		if (enabled.current()) {
 			applyServerGifts(previousGifts, !previousCursor.isEmpty());
@@ -692,6 +703,10 @@ void State::view(not_null<PeerData*> peer) {
 		if (!error.isEmpty()) {
 			return;
 		}
+		const auto previous = remoteProfiles.find(peer->id);
+		if (previous != end(remoteProfiles) && previous->second == object) {
+			return;
+		}
 		remoteProfiles[peer->id] = std::move(object);
 		const auto visible = remoteProfiles[peer->id].value(u"gifts"_q).toArray();
 		auto wornId = QString();
@@ -710,15 +725,26 @@ void State::view(not_null<PeerData*> peer) {
 		for (const auto &value : visible) {
 			if (value.toObject().value(u"worn"_q).toBool()) {
 				acceptGift(value.toObject());
-				if (const auto worn = ranges::find(records,
-						value.toObject().value(u"id"_q).toString(), &Record::serverId)
-					; worn != end(records)) {
+				const auto worn = findServerRecord(
+					value.toObject().value(u"id"_q).toString());
+				if (worn != end(records)) {
 					refreshGift(worn->gift.manageId);
 				}
 			}
 		}
 		notify();
 	});
+}
+
+std::vector<Record>::iterator State::findServerRecord(const QString &id) {
+	const auto found = serverRecordIds.find(id);
+	if (found == end(serverRecordIds)) {
+		return end(records);
+	}
+	const auto index = recordIndex.find(found->second);
+	return (index != end(recordIndex) && index->second < records.size())
+		? begin(records) + index->second
+		: end(records);
 }
 
 void State::acceptGift(QJsonObject object, bool newlySent) {
@@ -731,7 +757,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		return;
 	}
 	if (object == serverVersions[id]) {
-		const auto found = ranges::find(records, id, &Record::serverId);
+		const auto found = findServerRecord(id);
 		if (found != end(records)
 			&& found->active == object.value(u"active"_q).toBool(true)) {
 			return;
@@ -775,7 +801,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 			gift.info.unique->starsForResale = int(std::min<int64>(sale, INT_MAX));
 		}
 	}
-	auto found = ranges::find(records, id, &Record::serverId);
+	auto found = findServerRecord(id);
 	if (found == end(records) && records.size() >= 2 * kMaxGifts) {
 		for (auto i = records.size(); i != 0; ) {
 			--i;
@@ -783,6 +809,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 			if (!record.serverId.isEmpty() && record.sender != session->userPeerId()
 				&& record.recipient != session->userPeerId() && record.recipient != recipient) {
 				serverVersions.erase(record.serverId);
+				serverRecordIds.erase(record.serverId);
 				records.erase(begin(records) + i);
 			}
 		}
@@ -802,15 +829,15 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		}
 		recordIndex.emplace(gift.manageId.userMessageId(), records.size());
 		records.push_back({ *source, gift, recipient, Encode(*source), price, sender, id, active });
+		found = std::prev(end(records));
 	}
+	serverRecordIds.insert_or_assign(id, found->gift.manageId.userMessageId());
 	serverVersions[id] = std::move(object);
-	const auto current = ranges::find(records, id, &Record::serverId);
-	current->worn = active && serverVersions[id].value(u"worn"_q).toBool();
+	found->worn = active && serverVersions[id].value(u"worn"_q).toBool();
 	wornStatusesDirty = true;
 	if (enabled.current() && newlySent) {
-		const auto record = ranges::find(records, id, &Record::serverId);
 		const auto chat = recipient == session->userPeerId() ? sender : recipient;
-		restoreMessage(*record, session->data().history(chat), true);
+		restoreMessage(*found, session->data().history(chat), true);
 	}
 }
 
@@ -1007,6 +1034,28 @@ bool Enabled(not_null<Main::Session*> session) {
 	return Get(session).enabled.current();
 }
 
+bool BlockGiftPayment(
+		not_null<Main::Session*> session,
+		const MTPInputInvoice &invoice) {
+	if (!Enabled(session)) {
+		return false;
+	}
+	switch (invoice.type()) {
+	case mtpc_inputInvoiceStarGift:
+	case mtpc_inputInvoiceStarGiftUpgrade:
+	case mtpc_inputInvoiceStarGiftTransfer:
+	case mtpc_inputInvoiceStarGiftResale:
+	case mtpc_inputInvoiceStarGiftPrepaidUpgrade:
+	case mtpc_inputInvoiceStarGiftDropOriginalDetails:
+	case mtpc_inputInvoiceStarGiftAuctionBid:
+	case mtpc_inputInvoicePremiumGiftStars:
+	case mtpc_inputInvoicePremiumGiftCode:
+		return true;
+	default:
+		return false;
+	}
+}
+
 rpl::producer<bool> EnabledValue(not_null<Main::Session*> session) {
 	return Get(session).enabled.value();
 }
@@ -1052,6 +1101,8 @@ bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 		state.resourceQueue.clear();
 		state.resourcesLoading = 0;
 		state.catalogRefreshed = false;
+		state.giftSources.clear();
+		state.giftSourceOrder.clear();
 		state.restoredPeers.clear();
 		for (auto &record : state.records) {
 			record.resourcesRequested = false;
@@ -1131,6 +1182,7 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	state.serverGifts = {};
 	state.pendingServerGifts = {};
 	state.serverVersions.clear();
+	state.serverRecordIds.clear();
 	state.remoteProfiles.clear();
 	state.remoteAttempts.clear();
 	state.watchedPeer = PeerId();
@@ -1313,6 +1365,86 @@ void SaveProfile(
 	});
 }
 
+void RememberGiftSource(
+		not_null<Main::Session*> session,
+		const MTPStarGift &source) {
+	const auto i = States().find(session);
+	if (i == end(States()) || !i->second->enabled.current()) {
+		return;
+	}
+	auto &state = *i->second;
+	const auto key = source.match([](const MTPDstarGift &data) {
+		return QString::number(data.vid().v);
+	}, [](const MTPDstarGiftUnique &data) {
+		return qs(data.vslug());
+	});
+	if (!state.giftSources.contains(key)) {
+		if (state.giftSourceOrder.size() >= kMaxGiftSources) {
+			state.giftSources.erase(state.giftSourceOrder.front());
+			state.giftSourceOrder.pop_front();
+		}
+		state.giftSourceOrder.push_back(key);
+	}
+	state.giftSources.insert_or_assign(key, source);
+}
+
+void SendGift(
+		not_null<PeerData*> recipient,
+		uint64 giftId,
+		QString slug,
+		QString message,
+		bool anonymous,
+		CreditsAmount price,
+		QString operation,
+		Fn<void(std::optional<Data::SavedStarGift>, QString)> done) {
+	const auto session = &recipient->session();
+	auto &state = Get(session);
+	if (!state.enabled.current() || !recipient->isUser()) {
+		done({}, u"NOT_SUPPORTED"_q);
+		return;
+	}
+	const auto send = [=](const MTPStarGift &source) {
+		SendGift(recipient, source, message, anonymous, price, operation, done);
+	};
+	const auto key = slug.isEmpty() ? QString::number(giftId) : slug;
+	const auto cached = state.giftSources.find(key);
+	if (cached != end(state.giftSources)) {
+		const auto source = cached->second;
+		send(source);
+		return;
+	}
+	const auto fail = [=](const MTP::Error &error) {
+		done({}, error.type());
+	};
+	if (!slug.isEmpty()) {
+		state.api.request(MTPpayments_GetUniqueStarGift(
+			MTP_string(slug)
+		)).done([=](const MTPpayments_UniqueStarGift &result) {
+			session->data().processUsers(result.data().vusers());
+			send(result.data().vgift());
+		}).fail(fail).send();
+	} else {
+		state.api.request(MTPpayments_GetStarGifts(
+			MTP_int(0)
+		)).done([=](const MTPpayments_StarGifts &result) {
+			if (result.type() == mtpc_payments_starGifts) {
+				const auto &data = result.c_payments_starGifts();
+				session->data().processUsers(data.vusers());
+				session->data().processChats(data.vchats());
+				for (const auto &source : data.vgifts().v) {
+					RememberGiftSource(session, source);
+					if (source.type() == mtpc_starGift
+						&& uint64(source.c_starGift().vid().v) == giftId) {
+						send(source);
+						return;
+					}
+				}
+			}
+			done({}, u"INVALID_GIFT"_q);
+		}).fail(fail).send();
+	}
+}
+
 void SendGift(
 		not_null<PeerData*> recipient,
 		const MTPStarGift &source,
@@ -1379,7 +1511,7 @@ void SendGift(
 			state.serverGifts.push_back(value);
 		}
 		state.acceptGift(value, !state.serverVersions.contains(id));
-		const auto found = ranges::find(state.records, id, &Record::serverId);
+		const auto found = state.findServerRecord(id);
 		const auto saved = found != end(state.records)
 			? std::make_optional(found->gift) : std::nullopt;
 		(void)state.save();
@@ -1781,6 +1913,8 @@ bool RemoveGift(not_null<Main::Session*> session, Data::SavedStarGiftId id) {
 			--entry.second;
 		}
 	}
+	state.serverRecordIds.erase(record.serverId);
+	state.serverVersions.erase(record.serverId);
 	state.removeMessage(record);
 	state.notify();
 	return true;
