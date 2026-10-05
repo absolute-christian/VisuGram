@@ -46,13 +46,17 @@ class UserConfig:
 class AppEvent:
     START, STOP, PAUSE, RESUME = range(4)
 
+class HookStrategy:
+    CANCEL = "cancel"
+
 def run_ui(fn, delay=0):
     (DELAYED if delay else UI).append(fn)
 
 for name in ("java", "org", "org.telegram", "ui"):
     module(name)
 module("android_utils", run_on_ui_thread=run_ui)
-module("base_plugin", AppEvent=AppEvent, BasePlugin=BasePlugin, MethodHook=object)
+module("base_plugin", AppEvent=AppEvent, BasePlugin=BasePlugin, MethodHook=object,
+       HookResult=Setting, HookStrategy=HookStrategy)
 module("client_utils", EXTERNAL_NETWORK_QUEUE="external", get_last_fragment=lambda: VISIBLE,
        run_on_queue=lambda fn, queue: NETWORK.append(fn))
 module("hook_utils", find_class=lambda name: None, get_private_field=lambda obj, name: getattr(obj, name, None))
@@ -263,7 +267,7 @@ class ProfileTests(unittest.TestCase):
                   and node.targets[0].id.startswith("__")}
         self.assertEqual(source.suffix, ".plugin")
         self.assertEqual(values["__sdk_version__"], ">=1.4.0")
-        self.assertEqual(values["__version__"], "0.2.1")
+        self.assertEqual(values["__version__"], "0.3.0")
 
     def test_legacy_editor_without_edittext_or_logger(self):
         self.assertIsNone(plugin.EditText)

@@ -1,5 +1,7 @@
+import base64
 import json
 import re
+import struct
 import time
 import urllib.error
 import urllib.request
@@ -8,7 +10,7 @@ from collections import OrderedDict
 from decimal import Decimal
 
 from android_utils import run_on_ui_thread
-from base_plugin import AppEvent, BasePlugin, MethodHook
+from base_plugin import AppEvent, BasePlugin, HookResult, HookStrategy, MethodHook
 from client_utils import (
     EXTERNAL_NETWORK_QUEUE, get_last_fragment, run_on_queue,
 )
@@ -26,9 +28,9 @@ except ImportError:
 
 __id__ = "visugram"
 __name__ = "VisuGram Preview"
-__description__ = "Shared visual usernames and anonymous numbers. Gift port in development."
+__description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -38,6 +40,219 @@ POLL_MS = 30_000
 REMOTE_LIMIT = 32
 MAX_RESPONSE = 256 * 1024
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+PAYMENT_REQUESTS = ("TL_payments_sendStarsForm", "TL_payments_sendPaymentForm", "TL_payments_sendStarsFormV2")
+GIFT_MUTATIONS = ("saveStarGift", "convertStarGift", "transferStarGift", "updateStarGiftPrice", "upgradeStarGift",
+                  "sendStarGiftOffer", "resolveStarGiftOffer", "craftStarGift", "toggleStarGiftsPinnedToTop")
+
+def java_items(values):
+    return [values.get(index) for index in range(values.size())] if values is not None else []
+
+def native_bytes(value):
+    from android.util import Base64
+    from org.telegram.tgnet import SerializedData
+
+    stream = SerializedData()
+    try:
+        value.serializeToStream(stream)
+        return base64.b64decode(str(Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)))
+    finally:
+        stream.cleanup()
+
+def tl_string(value):
+    data = str(value or "").encode("utf-8")
+    prefix = bytes([len(data)]) if len(data) < 254 else b"\xfe" + len(data).to_bytes(3, "little")
+    result = prefix + data
+    return result + bytes((-len(result)) % 4)
+
+def tl_int(value):
+    return struct.pack("<I", int(value) & 0xffffffff)
+
+def gift_source(gift, serializer=native_bytes):
+    name = str(gift.getClass().getSimpleName())
+    if name.startswith("TL_starGiftUnique"):
+        attributes = []
+        for attribute in java_items(gift.attributes):
+            kind = str(attribute.getClass().getSimpleName())
+            if "OriginalDetails" in kind:
+                attributes.append(serializer(attribute))
+                continue
+            rarity = getattr(attribute, "rarity", None)
+            permille = getattr(rarity, "permille", getattr(attribute, "rarity_permille", 0))
+            rarities = {"TL_starGiftAttributeRarityUncommon": 0xdbce6389,
+                        "TL_starGiftAttributeRarityRare": 0xf08d516b,
+                        "TL_starGiftAttributeRarityEpic": 0x78fbf3a8,
+                        "TL_starGiftAttributeRarityLegendary": 0xcef7e7a8}
+            rarity_name = str(rarity.getClass().getSimpleName()) if rarity is not None else ""
+            encoded_rarity = tl_int(rarities[rarity_name]) if rarity_name in rarities else tl_int(0x36437737) + tl_int(permille)
+            if kind.startswith("starGiftAttributeModel"):
+                data = tl_int(0x565251e2) + tl_int(1 if getattr(attribute, "crafted", False) else 0)
+                data += tl_string(attribute.name) + serializer(attribute.document)
+            elif kind.startswith("starGiftAttributePattern"):
+                data = tl_int(0x4e7085ea) + tl_string(attribute.name) + serializer(attribute.document)
+            elif kind.startswith("starGiftAttributeBackdrop"):
+                data = tl_int(0x9f2504e4) + tl_string(attribute.name)
+                data += b"".join(tl_int(getattr(attribute, key)) for key in (
+                    "backdrop_id", "center_color", "edge_color", "pattern_color", "text_color"))
+            else:
+                raise ApiError("UNSUPPORTED_GIFT")
+            attributes.append(data + encoded_rarity)
+        if len(attributes) > 16:
+            raise ApiError("UNSUPPORTED_GIFT")
+        data = tl_int(0x85f0a9cd) + tl_int(0) + struct.pack("<qq", int(gift.id), int(getattr(gift, "gift_id", 0)))
+        data += tl_string(gift.title) + tl_string(gift.slug) + tl_int(gift.num)
+        data += tl_int(0x1cb5c415) + tl_int(len(attributes)) + b"".join(attributes)
+        data += tl_int(gift.availability_issued) + tl_int(gift.availability_total)
+    else:
+        flags = int(bool(gift.limited)) | (int(bool(gift.sold_out)) << 1)
+        title = str(getattr(gift, "title", "") or "")
+        flags |= 32 if title else 0
+        data = tl_int(0x313a9547) + tl_int(flags) + struct.pack("<q", int(gift.id)) + serializer(gift.sticker)
+        data += struct.pack("<q", int(gift.stars))
+        if flags & 1:
+            data += tl_int(gift.availability_remains) + tl_int(gift.availability_total)
+        data += struct.pack("<q", int(gift.convert_stars))
+        if flags & 2:
+            data += tl_int(gift.first_sale_date) + tl_int(gift.last_sale_date)
+        if flags & 32:
+            data += tl_string(title)
+    result = base64.b64encode(data).decode("ascii")
+    if len(result) > 16384:
+        raise ApiError("UNSUPPORTED_GIFT")
+    return result
+
+def native_stream(encoded):
+    from android.util import Base64
+    from org.telegram.tgnet import SerializedData
+
+    raw = base64.b64decode(encoded, validate=True)
+    if not raw or len(raw) % 4 or len(encoded) > 16384:
+        raise ApiError("UNSUPPORTED_GIFT")
+    return SerializedData(Base64.decode(encoded, Base64.DEFAULT))
+
+def decode_gift(encoded):
+    from org.telegram.tgnet import TLRPC
+    from org.telegram.tgnet.tl import TL_stars
+
+    stream = native_stream(encoded)
+    try:
+        gift = TL_stars.StarGift.TLdeserialize(stream, stream.readInt32(True), False)
+        if gift is not None and gift.getDocument() is not None:
+            return gift
+    except Exception:
+        pass
+    finally:
+        stream.cleanup()
+    stream = native_stream(encoded)
+    try:
+        constructor, flags = stream.readInt32(True) & 0xffffffff, stream.readInt32(True)
+        if constructor == 0x313a9547:
+            gift = TL_stars.TL_starGift()
+            gift.id = stream.readInt64(True)
+            gift.sticker = TLRPC.Document.TLdeserialize(stream, stream.readInt32(True), True)
+            gift.stars = stream.readInt64(True)
+            gift.limited, gift.sold_out = bool(flags & 1), bool(flags & 2)
+            if flags & 1:
+                gift.availability_remains, gift.availability_total = stream.readInt32(True), stream.readInt32(True)
+            if flags & 16:
+                stream.readInt64(True)
+            gift.convert_stars = stream.readInt64(True)
+            if flags & 2:
+                gift.first_sale_date, gift.last_sale_date = stream.readInt32(True), stream.readInt32(True)
+            if flags & 8:
+                gift.upgrade_stars = stream.readInt64(True)
+            if flags & 16:
+                stream.readInt64(True)
+            if flags & 32:
+                gift.title = stream.readString(True)
+        elif constructor == 0x85f0a9cd:
+            gift = TL_stars.TL_starGiftUnique()
+            gift.id = stream.readInt64(True)
+            gift_id = stream.readInt64(True)
+            if hasattr(gift, "gift_id"):
+                gift.gift_id = gift_id
+            gift.title, gift.slug, gift.num = stream.readString(True), stream.readString(True), stream.readInt32(True)
+            if flags & 1:
+                gift.owner_id = TLRPC.Peer.TLdeserialize(stream, stream.readInt32(True), True)
+            if flags & 2:
+                gift.owner_name = stream.readString(True)
+            if flags & 4:
+                gift.owner_address = stream.readString(True)
+            if stream.readInt32(True) & 0xffffffff != 0x1cb5c415:
+                raise ApiError("UNSUPPORTED_GIFT")
+            count = stream.readInt32(True)
+            if count < 0 or count > 16:
+                raise ApiError("UNSUPPORTED_GIFT")
+            for _ in range(count):
+                kind = stream.readInt32(True) & 0xffffffff
+                if kind == 0xe0bff26c:
+                    gift.attributes.add(TL_stars.StarGiftAttribute.TLdeserialize(stream, kind - 2**32, True))
+                    continue
+                constructors = {0x565251e2: TL_stars.starGiftAttributeModel,
+                                0x4e7085ea: TL_stars.starGiftAttributePattern,
+                                0x9f2504e4: TL_stars.starGiftAttributeBackdrop}
+                if kind not in constructors:
+                    raise ApiError("UNSUPPORTED_GIFT")
+                attribute = constructors[kind]()
+                if kind == 0x565251e2:
+                    crafted = bool(stream.readInt32(True) & 1)
+                    if hasattr(attribute, "crafted"):
+                        attribute.crafted = crafted
+                attribute.name = stream.readString(True)
+                if kind == 0x9f2504e4:
+                    for key in ("backdrop_id", "center_color", "edge_color", "pattern_color", "text_color"):
+                        setattr(attribute, key, stream.readInt32(True))
+                else:
+                    attribute.document = TLRPC.Document.TLdeserialize(stream, stream.readInt32(True), True)
+                rarity_id = stream.readInt32(True) & 0xffffffff
+                if rarity_id == 0x36437737:
+                    permille = stream.readInt32(True)
+                elif rarity_id in (0xdbce6389, 0xf08d516b, 0x78fbf3a8, 0xcef7e7a8):
+                    permille = 0
+                else:
+                    raise ApiError("UNSUPPORTED_GIFT")
+                if hasattr(attribute, "rarity"):
+                    attribute.rarity = TL_stars.TL_starGiftAttributeRarity()
+                    attribute.rarity.permille = permille
+                else:
+                    attribute.rarity_permille = permille
+                gift.attributes.add(attribute)
+            gift.availability_issued, gift.availability_total = stream.readInt32(True), stream.readInt32(True)
+        else:
+            raise ApiError("UNSUPPORTED_GIFT")
+        return gift
+    finally:
+        stream.cleanup()
+
+def gift_payload(gift, recipient, message, anonymous, price, currency, serializer=native_bytes):
+    if recipient <= 0 or currency not in ("XTR", "TON") or not re.fullmatch(r"[0-9]{1,18}", str(price)):
+        raise ApiError("INVALID_GIFT")
+    text = str(message.text or "") if message is not None else ""
+    if len(text) > 255:
+        raise ApiError("INVALID_MESSAGE")
+    return {"recipient_id": str(recipient), "source": gift_source(gift, serializer),
+            "slug": str(getattr(gift, "slug", "") or ""), "message": text,
+            "message_data": base64.b64encode(serializer(message)).decode("ascii") if text else "",
+            "anonymous": bool(anonymous), "price": str(price), "currency": currency}
+
+def validate_gift(record):
+    if not isinstance(record, dict):
+        raise ValueError("INVALID_GIFT")
+    for field in ("id", "sender_id", "recipient_id", "source", "slug", "message", "message_data", "price", "currency"):
+        value = record.get(field, "" if field == "message_data" else None)
+        if not isinstance(value, str) or len(value) > (16384 if field in ("source", "message_data") else 512):
+            raise ValueError("INVALID_GIFT")
+    if (not re.fullmatch(r"[0-9]{1,20}", record["sender_id"])
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", record["recipient_id"])
+            or record["currency"] not in ("XTR", "TON") or not re.fullmatch(r"[0-9]{1,18}", record["price"])
+            or type(record.get("date")) is not int or not 0 <= record["date"] < 2**31):
+        raise ValueError("INVALID_GIFT")
+    return dict(record)
+
+def gift_price(record):
+    if record["currency"] == "TON":
+        amount = format(Decimal(record["price"]) / 1_000_000_000, ".9f").rstrip("0").rstrip(".")
+        return amount + " TON"
+    return record["price"] + " ★"
 
 def get_user_config(account):
     return UserConfig.getInstance(account)
@@ -180,6 +395,61 @@ class AssetClickHook(MethodHook):
         except Exception:
             self.plugin._native_error()
 
+class GiftBuyHook(MethodHook):
+    def __init__(self, plugin, resale=False):
+        self.plugin, self.resale = plugin, resale
+
+    def before_hooked_method(self, param):
+        if not self.plugin._visual_enabled():
+            return
+        param.setResult(None)
+        callback = param.args[-1]
+        try:
+            account = int(get_private_field(param.thisObject, "currentAccount"))
+            if self.resale:
+                form, gift, recipient = param.args[0], param.args[1], int(param.args[2])
+                message, anonymous = (param.args[3], bool(param.args[4])) if len(param.args) == 6 else (None, True)
+                price = sum(int(value.amount) for value in java_items(form.invoice.prices))
+                currency = "TON" if bool(get_private_field(param.thisObject, "ton")) else "XTR"
+            else:
+                gift, anonymous, upgraded, recipient, message = param.args[:5]
+                if upgraded:
+                    raise ApiError("UPGRADE_UNAVAILABLE")
+                price, currency = int(gift.stars), "XTR"
+            body = gift_payload(gift, int(recipient), message, anonymous, price, currency)
+            self.plugin._send_visual(account, body, callback)
+        except Exception as error:
+            self.plugin._gift_callback(callback, False)
+            self.plugin._show_error(getattr(error, "code", "UNSUPPORTED_GIFT"))
+
+class PremiumGiftHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._visual_enabled():
+            param.setResult(None)
+            try:
+                get_private_field(param.thisObject, "button").setLoading(False)
+            except Exception:
+                pass
+            self.plugin._show_error("PREMIUM_UNAVAILABLE")
+
+class GiftBalanceHook(MethodHook):
+    def __init__(self, plugin, intro):
+        self.plugin, self.intro = plugin, intro
+
+    def after_hooked_method(self, param):
+        if not self.plugin._visual_enabled():
+            return
+        try:
+            if self.intro:
+                get_private_field(param.thisObject, "starBalanceTextView").setText("∞")
+            elif get_private_field(param.thisObject, "starGift") is not None:
+                get_private_field(param.thisObject, "button").setSubText(None, False)
+        except Exception:
+            pass
+
 class VisuGramPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -189,6 +459,8 @@ class VisuGramPlugin(BasePlugin):
         self._remote, self._remote_busy = OrderedDict(), {}
         self._native, self._warned = False, False
         self._span_fragments = None
+        self._gift_native, self._gift_busy, self._payment_guard = False, {}, False
+        self._gift_page_state, self._gift_page_busy = None, None
 
     def on_plugin_load(self):
         self._generation = getattr(self, "_generation", 0) + 1
@@ -196,7 +468,11 @@ class VisuGramPlugin(BasePlugin):
         self._busy, self._saving, self._snapshots = {}, {}, {}
         self._remote, self._remote_busy = OrderedDict(), {}
         self._native, self._warned = False, False
+        self._gift_page_busy = None
         self._install_native()
+        self._install_gifts()
+        if self.get_setting("visual_gifts", False) and not self._payment_guard:
+            self.set_setting("visual_gifts", False)
         self._restart()
 
     def on_plugin_unload(self):
@@ -207,6 +483,7 @@ class VisuGramPlugin(BasePlugin):
         self._rebind_visible()
         if self._span_fragments is not None:
             self._span_fragments.clear()
+        self._gift_page_state = None
 
     def on_app_event(self, event_type):
         if not getattr(self, "_loaded", False):
@@ -263,6 +540,398 @@ class VisuGramPlugin(BasePlugin):
     def _running(self, generation):
         return (self._loaded and self._foreground and generation == self._generation
                 and self.get_setting("sync_enabled", False))
+
+    def _visual_enabled(self):
+        return self._loaded and self.get_setting("visual_gifts", False)
+
+    def _install_gifts(self):
+        self._gift_native, self._payment_guard = False, False
+        try:
+            for name in PAYMENT_REQUESTS:
+                self.add_hook(name)
+            for name in GIFT_MUTATIONS:
+                self.add_hook(name)
+            self._payment_guard = True
+            buy = find_method("org.telegram.ui.Stars.StarsController", "buyStarGift", [
+                "org.telegram.tgnet.tl.TL_stars$StarGift", "boolean", "boolean", "long",
+                "org.telegram.tgnet.TLRPC$TL_textWithEntities", "org.telegram.messenger.Utilities$Callback2",
+            ])
+            resale = find_method("org.telegram.ui.Stars.StarsController", "buyResellingGift", [
+                "org.telegram.tgnet.TLRPC$TL_payments_paymentFormStarGift", "org.telegram.tgnet.tl.TL_stars$StarGift",
+                "long", "org.telegram.messenger.Utilities$Callback2",
+            ])
+            resale_message = find_method("org.telegram.ui.Stars.StarsController", "buyResellingGift", [
+                "org.telegram.tgnet.TLRPC$TL_payments_paymentFormStarGift", "org.telegram.tgnet.tl.TL_stars$StarGift",
+                "long", "org.telegram.tgnet.TLRPC$TL_textWithEntities", "boolean",
+                "org.telegram.messenger.Utilities$Callback2",
+            ])
+            if buy is None:
+                return
+            premium = find_method("org.telegram.ui.Gifts.SendGiftSheet", "buyPremiumTier", [])
+            if premium is None:
+                return
+            hooks = []
+            try:
+                hooks.append(self.hook_method(buy, GiftBuyHook(self)))
+                hooks.append(self.hook_method(premium, PremiumGiftHook(self)))
+                for method in (resale, resale_message):
+                    if method is not None:
+                        hooks.append(self.hook_method(method, GiftBuyHook(self, True)))
+                if not all(hooks):
+                    raise ValueError("HOOK_UNAVAILABLE")
+                self._gift_native = True
+                for class_name, name, args, intro in (
+                    ("org.telegram.ui.Stars.StarsIntroActivity", "updateBalance", [], True),
+                    ("org.telegram.ui.Gifts.SendGiftSheet", "setButtonText", ["boolean"], False),
+                ):
+                    method = find_method(class_name, name, args)
+                    if method is not None:
+                        self.hook_method(method, GiftBalanceHook(self, intro))
+            except Exception:
+                self._gift_native = False
+                for hook in hooks:
+                    if hook:
+                        self.unhook_method(hook)
+                raise
+        except Exception:
+            self.log("VisuGram gift hooks are unavailable for this client version.")
+
+    def pre_request_hook(self, request_name, account, request):
+        reference = getattr(request, "stargift", None)
+        virtual_reference = reference is not None and (
+            int(getattr(reference, "msg_id", 0)) < 0 or int(getattr(reference, "saved_id", 0)) < 0)
+        if virtual_reference or (self._visual_enabled() and request_name in (*PAYMENT_REQUESTS, *GIFT_MUTATIONS)):
+            run_on_ui_thread(lambda: self._show_error("REAL_PAYMENT_BLOCKED"))
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    def _gift_toggle(self, enabled):
+        if enabled and (not self._gift_native or not self._payment_guard):
+            self.set_setting("visual_gifts", False, reload_settings=True)
+            self._show_error("GIFT_HOOK_UNAVAILABLE")
+            return
+        self.set_setting("visual_gifts", bool(enabled), reload_settings=True)
+
+    def _gift_callback(self, callback, success):
+        if callback is not None:
+            try:
+                from java.lang import Boolean
+
+                callback.run(Boolean.valueOf(success), None)
+            except Exception:
+                self.log("VisuGram gift completion callback failed.")
+
+    def _send_visual(self, account, body, callback):
+        generation = self._generation
+        user = get_user_config(account).getCurrentUser()
+        if not self._running(generation) or user is None:
+            self._gift_callback(callback, False)
+            self._show_error("SYNC_DISABLED")
+            return
+        user_id = str(user.id)
+        if user_id in self._gift_busy:
+            self._gift_callback(callback, False)
+            self._show_error("GIFT_BUSY")
+            return
+        fingerprint = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        previous = self.get_setting("gift_operation:" + user_id, {})
+        operation = previous.get("id") if isinstance(previous, dict) and previous.get("body") == fingerprint else None
+        if not isinstance(operation, str) or not re.fullmatch(r"[A-Za-z0-9-]{16,64}", operation):
+            operation = str(uuid.uuid4())
+        self.set_setting("gift_operation:" + user_id, {"body": fingerprint, "id": operation})
+        payload = dict(body, operation_id=operation)
+        self._gift_busy[user_id] = operation
+
+        def work():
+            try:
+                post_json("/v1/sync", user_id, {"telegram_username": str(user.username or ""), "profile_only": True})
+                result = post_json("/v1/gifts", user_id, payload, timeout=20)
+                record = validate_gift(result["gift"]) if "gift" in result else None
+                if record is None and result.get("local_only") is not True:
+                    raise ValueError("INVALID_GIFT")
+                error = ""
+            except (OSError, ValueError, TypeError, KeyError, ApiError) as failure:
+                record, error = None, getattr(failure, "code", "SERVER_UNAVAILABLE")
+            run_on_ui_thread(lambda: self._gift_finish(account, user_id, generation, payload, record, error, callback))
+
+        run_on_queue(work, EXTERNAL_NETWORK_QUEUE)
+
+    def _gift_finish(self, account, user_id, generation, body, record, error, callback):
+        operation = body["operation_id"]
+        if self._gift_busy.get(user_id) == operation:
+            del self._gift_busy[user_id]
+        user = get_user_config(account).getCurrentUser()
+        if not self._running(generation) or user is None or str(user.id) != user_id:
+            self._gift_callback(callback, False)
+            return
+        if error:
+            self._gift_callback(callback, False)
+            self._show_error(error)
+            return
+        if record is None:
+            local = self.get_setting("local_gifts:" + user_id, [])
+            local = [item for item in local if isinstance(item, dict) and item.get("id") != "local:" + operation][-11:]
+            record = dict(body, id="local:" + operation, sender_id=user_id, date=int(time.time()),
+                          active=True, hidden=False, pinned=False, local_only=True)
+            self.set_setting("local_gifts:" + user_id, [record, *local])
+            self._show_error("LOCAL_ONLY")
+        self.set_setting("gift_operation:" + user_id, {})
+        self._gift_page_state = None
+        cached = dict(self._cache(user_id))
+        if cached:
+            cached["cursor"] = ""
+            self._snapshots[user_id] = cached
+        self._gift_callback(callback, True)
+        self._refresh(generation)
+        try:
+            from org.telegram.ui import LaunchActivity
+
+            activity = LaunchActivity.instance
+            if activity is not None and activity.getFireworksOverlay() is not None:
+                activity.getFireworksOverlay().start(True)
+        except Exception:
+            pass
+        BulletinHelper.show_info(self._text("Visual gift sent.", "Визуальный подарок отправлен."))
+
+    def _open_shop(self):
+        if not self._visual_enabled() or not self._gift_native or not self._running(self._generation):
+            self._show_error("GIFT_HOOK_UNAVAILABLE" if not self._gift_native else "SYNC_DISABLED")
+            return
+        try:
+            from org.telegram.ui.Gifts import GiftSheet
+
+            fragment = get_last_fragment()
+            account = int(UserConfig.selectedAccount)
+            user = get_user_config(account).getCurrentUser()
+            if fragment is not None and user is not None and fragment.getParentActivity() is not None:
+                GiftSheet(fragment.getParentActivity(), account, int(user.id), None).show()
+        except Exception:
+            self._show_error("GIFT_HOOK_UNAVAILABLE")
+
+    def _load_gift_page(self, direction="received", offset="", cursor="", owner=None):
+        generation, account = self._generation, int(UserConfig.selectedAccount)
+        user = get_user_config(account).getCurrentUser()
+        if not self._running(generation) or user is None:
+            self._show_error("SYNC_DISABLED")
+            return
+        if self._gift_page_busy is not None:
+            return
+        self._gift_page_busy = generation
+        user_id = str(user.id)
+
+        def work():
+            try:
+                result = post_json("/v1/gifts/page", user_id, {"direction": direction, "offset": offset,
+                                                             "cursor": cursor, "owner_id": owner or user_id})
+                records = result.get("gifts")
+                if (not isinstance(records, list) or len(records) > 6 or type(result.get("count")) is not int
+                        or not isinstance(result.get("cursor"), str) or not isinstance(result.get("next_offset"), str)):
+                    raise ValueError("INVALID_GIFT_PAGE")
+                page = dict(result, gifts=[validate_gift(record) for record in records], direction=direction, owner=owner or user_id)
+                error = ""
+            except (OSError, ValueError, TypeError, ApiError) as failure:
+                page, error = None, getattr(failure, "code", "SERVER_UNAVAILABLE")
+            run_on_ui_thread(lambda: self._page_finish(account, user_id, generation, page, error))
+
+        run_on_queue(work, EXTERNAL_NETWORK_QUEUE)
+
+    def _page_finish(self, account, user_id, generation, page, error):
+        if self._gift_page_busy == generation:
+            self._gift_page_busy = None
+        user = get_user_config(account).getCurrentUser()
+        if not self._running(generation) or user is None or str(user.id) != user_id:
+            return
+        if error:
+            self._show_error(error)
+            return
+        self._gift_page_state = dict(page, user_id=user_id, account=account)
+        self.set_setting("gift_page_loaded", int(time.time()), reload_settings=True)
+        selected = get_user_config(int(UserConfig.selectedAccount)).getCurrentUser()
+        if selected is not None and str(selected.id) == user_id:
+            self._page_dialog(page, user_id)
+
+    def _page_dialog(self, page, user_id):
+        fragment = get_last_fragment()
+        if fragment is None or fragment.getParentActivity() is None:
+            return
+        labels = [(record["slug"] or self._text("Gift", "Подарок")) + " · " + gift_price(record)
+                  for record in page["gifts"]]
+        if page["next_offset"]:
+            labels.append(self._text("Next page", "Следующая страница"))
+        if not labels:
+            BulletinHelper.show_info(self._text("No gifts yet.", "Подарков пока нет."))
+            return
+        dialog = AlertDialogBuilder(fragment.getParentActivity())
+        dialog.set_title(self._text("Visual gifts", "Визуальные подарки") + " · " + str(page["count"]))
+
+        def selected(builder, index):
+            builder.dismiss()
+            if index < len(page["gifts"]):
+                self._gift_actions(page["gifts"][index], user_id)
+            else:
+                self._load_gift_page(page["direction"], page["next_offset"], page["cursor"], page.get("owner"))
+
+        dialog.set_items(labels, selected)
+        dialog.set_negative_button(self._text("Close", "Закрыть"), lambda builder, index: builder.dismiss())
+        dialog.show()
+
+    def _gift_actions(self, record, user_id):
+        selected = get_user_config(int(UserConfig.selectedAccount)).getCurrentUser()
+        if not self._running(self._generation) or selected is None or str(selected.id) != user_id:
+            return
+        fragment = get_last_fragment()
+        if fragment is None or fragment.getParentActivity() is None:
+            return
+        actions = [(self._text("View gift", "Посмотреть подарок"), None)]
+        if record["recipient_id"] == user_id and record.get("active") and not record.get("local_only"):
+            if record["slug"]:
+                actions.append((self._text("Unpin from profile", "Открепить от профиля") if record.get("pinned") else
+                                self._text("Pin to profile", "Закрепить в профиле"), {"pinned": not record.get("pinned", False)}))
+                actions.append((self._text("Take off", "Снять") if record.get("worn") else self._text("Wear", "Носить"),
+                                {"worn": not record.get("worn", False)}))
+            actions.append((self._text("Show in profile", "Показать в профиле") if record.get("hidden") else
+                            self._text("Hide from profile", "Скрыть из профиля"), {"hidden": not record.get("hidden", False)}))
+        dialog = AlertDialogBuilder(fragment.getParentActivity())
+        dialog.set_title(record["slug"] or self._text("Gift", "Подарок"))
+        dialog.set_message(gift_price(record) + ("\n" + record["message"] if record["message"] else ""))
+
+        def selected(builder, index):
+            builder.dismiss()
+            if actions[index][1] is None:
+                self._open_gift(record)
+            else:
+                self._manage_visual(record, actions[index][1])
+
+        dialog.set_items([item[0] for item in actions], selected)
+        dialog.set_negative_button(self._text("Close", "Закрыть"), lambda builder, index: builder.dismiss())
+        dialog.show()
+
+    def _manage_visual(self, record, change):
+        generation, account = self._generation, int(UserConfig.selectedAccount)
+        user = get_user_config(account).getCurrentUser()
+        if not self._running(generation) or user is None or str(user.id) != record["recipient_id"] or record.get("local_only"):
+            self._show_error("NOT_GIFT_OWNER")
+            return
+        user_id = str(user.id)
+        if user_id in self._gift_busy:
+            self._show_error("GIFT_BUSY")
+            return
+        body = dict(change, id=record["id"])
+        fingerprint = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        previous = self.get_setting("gift_manage:" + user_id, {})
+        operation = previous.get("id") if isinstance(previous, dict) and previous.get("body") == fingerprint else None
+        if not isinstance(operation, str) or not re.fullmatch(r"[A-Za-z0-9-]{16,64}", operation):
+            operation = str(uuid.uuid4())
+        self.set_setting("gift_manage:" + user_id, {"id": operation, "body": fingerprint})
+        self._gift_busy[user_id] = operation
+        body["operation_id"] = operation
+
+        def work():
+            try:
+                result = post_json("/v1/gifts/manage", user_id, body)
+                updated, error = validate_gift(result.get("gift")), ""
+            except (OSError, ValueError, TypeError, ApiError) as failure:
+                updated, error = None, getattr(failure, "code", "SERVER_UNAVAILABLE")
+
+            def finish():
+                if self._gift_busy.get(user_id) == operation:
+                    del self._gift_busy[user_id]
+                current = get_user_config(account).getCurrentUser()
+                if not self._running(generation) or current is None or str(current.id) != user_id:
+                    return
+                if error:
+                    self._show_error(error)
+                    return
+                self.set_setting("gift_manage:" + user_id, {})
+                self._load_gift_page()
+                BulletinHelper.show_info(self._text("Gift updated.", "Подарок обновлён."))
+
+            run_on_ui_thread(finish)
+
+        run_on_queue(work, EXTERNAL_NETWORK_QUEUE)
+
+    def _open_gift(self, record):
+        if not self._running(self._generation):
+            return
+        try:
+            from org.telegram.tgnet import TLRPC
+            from org.telegram.tgnet.tl import TL_stars
+            from org.telegram.ui.Stars import StarGiftSheet
+
+            fragment = get_last_fragment()
+            if fragment is None or fragment.getParentActivity() is None:
+                return
+            gift = decode_gift(record["source"])
+            if str(gift.getClass().getSimpleName()).startswith("TL_starGiftUnique"):
+                gift.owner_id, gift.owner_address, gift.gift_address = None, None, None
+                gift.owner_name = self._text("Visual gift", "Визуальный подарок")
+                if getattr(gift, "resell_amount", None) is not None:
+                    gift.resell_amount.clear()
+            saved = TL_stars.TL_savedStarGift()
+            saved.gift, saved.date = gift, record["date"]
+            saved.msg_id, saved.flags = -1, 8
+            saved.name_hidden = bool(record.get("anonymous"))
+            saved.from_id = TLRPC.TL_peerUser()
+            saved.from_id.user_id = int(record["sender_id"])
+            if int(record["sender_id"]) > 0:
+                saved.flags |= 2
+            if record["message"]:
+                message = None
+                if record.get("message_data"):
+                    stream = native_stream(record["message_data"])
+                    try:
+                        message = TLRPC.TL_textWithEntities.TLdeserialize(stream, stream.readInt32(True), True)
+                    finally:
+                        stream.cleanup()
+                if message is None or str(message.text) != record["message"]:
+                    message = TLRPC.TL_textWithEntities()
+                    message.text = record["message"]
+                saved.message, saved.flags = message, saved.flags | 4
+            sheet = StarGiftSheet(fragment.getParentActivity(), int(UserConfig.selectedAccount), 0, fragment.getResourceProvider())
+            sheet.set(saved, None)
+            sheet.show()
+        except Exception:
+            self._show_error("UNSUPPORTED_GIFT")
+
+    def _gift_settings(self):
+        user = get_user_config(int(UserConfig.selectedAccount)).getCurrentUser()
+        fields = [
+            Header(text=self._text("Visual gifts", "Визуальные подарки")),
+            Switch(key="visual_gifts", default=False, text=self._text("Visual purchases", "Визуальные покупки"),
+                   subtext=self._text("Uses the native gift shop. Telegram payments are blocked while enabled.",
+                                     "Использует штатный магазин. При включении платежи Telegram блокируются."), on_change=self._gift_toggle),
+            Text(text=self._text("Buy a gift for myself", "Купить подарок себе"), on_click=lambda view: self._open_shop()),
+            Text(text=self._text("Received gifts — refresh", "Полученные подарки — обновить"),
+                 on_click=lambda view: self._load_gift_page()),
+            Text(text=self._text("Sent gifts", "Отправленные подарки"),
+                 on_click=lambda view: self._load_gift_page("sent")),
+        ]
+        page = self._gift_page_state
+        if page is not None and user is not None and page["user_id"] == str(user.id):
+            fields.append(Header(text=self._text("Gifts", "Подарки") + " · " + str(page["count"])))
+            for record in page["gifts"]:
+                title = record["slug"] or self._text("Gift", "Подарок")
+                text = gift_price(record) + (" · " + record["message"] if record["message"] else "")
+                fields.append(Text(text=title, subtext=text, on_click=lambda view, gift=record: self._gift_actions(gift, str(user.id))))
+            if page["next_offset"]:
+                fields.append(Text(text=self._text("Next page", "Следующая страница"), accent=True,
+                                   on_click=lambda view: self._load_gift_page(page["direction"], page["next_offset"], page["cursor"])))
+            if not page["gifts"]:
+                fields.append(Divider(text=self._text("No gifts yet.", "Подарков пока нет.")))
+        if user is not None:
+            local = self.get_setting("local_gifts:" + str(user.id), [])
+            if isinstance(local, list) and local:
+                fields.append(Header(text=self._text("Local gifts", "Локальные подарки")))
+                for record in local[:12]:
+                    try:
+                        record = validate_gift(record)
+                    except ValueError:
+                        continue
+                    fields.append(Text(text=record["slug"] or self._text("Gift", "Подарок"), subtext=gift_price(record),
+                                       on_click=lambda view, gift=record: self._open_gift(gift)))
+        fields.append(Divider(text=self._text("To give someone a gift, open Gift in their Telegram profile. Automatic upgrades are not available yet.",
+                                             "Для дарения открой «Подарок» в профиле Telegram. Автоматическое улучшение пока недоступно.")))
+        return fields
 
     def _restart(self):
         self._generation += 1
@@ -345,7 +1014,11 @@ class VisuGramPlugin(BasePlugin):
                 self._show_error(error)
             return
         if snapshot is not None:
+            previous_cursor = self._cache(user_id).get("cursor")
             self._store(user_id, snapshot)
+            if (self._gift_page_state is not None and self._gift_page_state["user_id"] == user_id
+                    and previous_cursor != snapshot["cursor"]):
+                self._gift_page_state = None
         if manual:
             BulletinHelper.show_info(self._text("Profile updated.", "Профиль обновлён."))
 
@@ -566,6 +1239,19 @@ class VisuGramPlugin(BasePlugin):
             "PROFILE_CHANGED": ("Profile changed on another device. Refresh before saving.", "Профиль изменён на другом устройстве. Обнови его перед сохранением."),
             "SOURCE_UNAVAILABLE": ("Fragment is unavailable. Try again later.", "Fragment недоступен. Попробуй позже."),
             "SYNC_REQUIRED": ("Refresh the profile before saving.", "Обнови профиль перед сохранением."),
+            "REAL_PAYMENT_BLOCKED": ("Real Telegram payments are blocked in visual mode.", "Настоящие платежи Telegram заблокированы в визуальном режиме."),
+            "GIFT_HOOK_UNAVAILABLE": ("Gift integration is unavailable in this client version.", "Интеграция подарков недоступна в этой версии клиента."),
+            "UNSUPPORTED_GIFT": ("This gift format is not supported by the installed client.", "Установленный клиент не поддерживает формат этого подарка."),
+            "UPGRADE_UNAVAILABLE": ("Turn off automatic gift upgrade. You can buy a collectible in the Collectibles tab.", "Выключи автоматическое улучшение. Коллекционный подарок можно купить во вкладке «Коллекционные»."),
+            "PREMIUM_UNAVAILABLE": ("Visual Premium subscriptions are not supported.", "Визуальные подписки Premium не поддерживаются."),
+            "GIFT_BUSY": ("Wait for the previous gift operation to finish.", "Дождись завершения предыдущей операции с подарком."),
+            "INVALID_GIFT": ("This gift cannot be sent to this recipient.", "Этот подарок нельзя отправить выбранному получателю."),
+            "INVALID_MESSAGE": ("Gift comments can contain up to 255 characters.", "Комментарий к подарку может содержать до 255 символов."),
+            "LOCAL_ONLY": ("Saved locally: this recipient has not connected to VisuGram yet.", "Сохранено локально: получатель ещё не подключался к VisuGram."),
+            "GIFT_LIMIT": ("The account gift limit has been reached.", "Достигнут лимит подарков аккаунта."),
+            "GIFT_PAGE_CHANGED": ("The gift list changed. Refresh received or sent gifts.", "Список подарков изменился. Обнови полученные или отправленные подарки."),
+            "NOT_GIFT_OWNER": ("Only the recipient can manage this gift.", "Управлять подарком может только получатель."),
+            "PIN_LIMIT": ("The profile pin limit has been reached.", "Достигнут лимит закреплённых подарков."),
         }
         english, russian = messages.get(code, ("Server unavailable. Try again later.", "Сервер недоступен. Попробуй позже."))
         BulletinHelper.show_info(self._text(english, russian))
@@ -691,11 +1377,14 @@ class VisuGramPlugin(BasePlugin):
             Text(text=self._text("Edit visual profile", "Изменить визуальный профиль"), create_sub_fragment=self._editor),
             Text(text=self._text("Usernames", "Юзернеймы"), subtext=", ".join("@" + name for name in profile["usernames"]) or "—"),
             Text(text=self._text("Phone number", "Номер телефона"), subtext=profile["phone"] or "—"),
-            Text(text=self._text("Visual gifts", "Визуальные подарки"), subtext=str(cached.get("gift_count", 0))),
+            Text(text=self._text("Visual gifts", "Визуальные подарки"), subtext=str(cached.get("gift_count", 0)),
+                 create_sub_fragment=self._gift_settings),
             Text(text=self._text("Profile integration", "Интеграция профиля"),
                  subtext=self._text("Available", "Доступна") if self._native else self._text(
                      "Unsupported client version. Shared profile is available in these settings.",
                      "Версия клиента не поддерживается. Общий профиль доступен в этих настройках.")),
-            Divider(text=self._text("Preview: profile integration is available. Gift shop and gift cards are still being ported.",
-                                    "Предварительная версия: интеграция профиля готова. Магазин и карточки подарков ещё переносятся.")),
+            Text(text=self._text("Gift integration", "Интеграция подарков"),
+                 subtext=self._text("Available", "Доступна") if self._gift_native else self._text("Unsupported client version", "Версия клиента не поддерживается")),
+            Divider(text=self._text("Preview: shared profiles, visual gift purchases and gift previews. Chat cards and profile gift grid are still being ported.",
+                                    "Предварительная версия: общий профиль, визуальные покупки и просмотр подарков. Карточки чата и сетка профиля ещё переносятся.")),
         ]
