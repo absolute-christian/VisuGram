@@ -1707,7 +1707,7 @@ void TransferGift(
 		if (error.isEmpty()) {
 			const auto localOnly = object.value(u"local_only"_q).toBool();
 			state.acceptMutation(std::move(object), true);
-			if (localOnly && !AddGift(recipient, source, QString(), false,
+			if (localOnly && !AddGift(recipient, source, TextWithEntities(), false,
 					CreditsAmount(), true)) {
 				error = u"STORAGE_ERROR"_q;
 			}
