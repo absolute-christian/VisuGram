@@ -30,7 +30,7 @@ __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -40,9 +40,11 @@ POLL_MS = 30_000
 REMOTE_LIMIT = 32
 MAX_RESPONSE = 256 * 1024
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
-PAYMENT_REQUESTS = ("TL_payments_sendStarsForm", "TL_payments_sendPaymentForm", "TL_payments_sendStarsFormV2")
-GIFT_MUTATIONS = ("saveStarGift", "convertStarGift", "transferStarGift", "updateStarGiftPrice", "upgradeStarGift",
-                  "sendStarGiftOffer", "resolveStarGiftOffer", "craftStarGift", "toggleStarGiftsPinnedToTop")
+PAYMENT_REQUESTS = ("TL_payments_getPaymentForm", "TL_payments_canPurchaseStore", "TL_payments_sendStarsForm",
+                    "TL_payments_sendPaymentForm", "TL_payments_sendStarsFormV2")
+GIFT_MUTATIONS = tuple("TL_payments_" + name for name in (
+    "saveStarGift", "convertStarGift", "transferStarGift", "updateStarGiftPrice", "upgradeStarGift",
+    "sendStarGiftOffer", "resolveStarGiftOffer", "craftStarGift", "toggleStarGiftsPinnedToTop"))
 
 def java_items(values):
     return [values.get(index) for index in range(values.size())] if values is not None else []
@@ -353,14 +355,27 @@ def visible_names(profile, real_main, real_names):
     main = profile["primary"] or (names[0] if names else "")
     return main, [name for name in names if name != main]
 
-def find_method(class_name, name, arguments):
+def reflection_class(class_name):
     clazz = find_class(class_name)
-    if clazz is not None:
+    if clazz is not None and hasattr(clazz, "getDeclaredMethods"):
+        return clazz
+    try:
+        from java.lang import Class
+        from org.telegram.messenger import ApplicationLoader
+
+        return Class.forName(class_name, False, ApplicationLoader.applicationContext.getClassLoader())
+    except Exception:
+        return None
+
+def find_method(class_name, name, arguments):
+    clazz = reflection_class(class_name)
+    while clazz is not None:
         for method in clazz.getDeclaredMethods():
             types = [str(value.getName()) for value in method.getParameterTypes()]
             if str(method.getName()) == name and types == arguments:
                 method.setAccessible(True)
                 return method
+        clazz = clazz.getSuperclass()
     return None
 
 class ProfileBindHook(MethodHook):
@@ -422,18 +437,67 @@ class GiftBuyHook(MethodHook):
             self.plugin._gift_callback(callback, False)
             self.plugin._show_error(getattr(error, "code", "UNSUPPORTED_GIFT"))
 
-class PremiumGiftHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
+class SheetGiftCallback:
+    def __init__(self, plugin, sheet):
+        self.plugin, self.sheet = plugin, sheet
+
+    def run(self, success, error):
+        try:
+            get_private_field(self.sheet, "button").setLoading(False)
+            if str(success).lower() == "true":
+                from org.telegram.messenger import AndroidUtilities
+
+                close = get_private_field(self.sheet, "closeParentSheet")
+                if close is not None:
+                    close.run()
+                AndroidUtilities.hideKeyboard(get_private_field(self.sheet, "messageEdit"))
+                self.sheet.dismiss()
+        except Exception:
+            self.plugin.log("VisuGram gift sheet completion failed.")
+
+class SheetGiftBuyHook(MethodHook):
+    def __init__(self, plugin, message_method):
+        self.plugin, self.message_method = plugin, message_method
 
     def before_hooked_method(self, param):
-        if self.plugin._visual_enabled():
-            param.setResult(None)
-            try:
-                get_private_field(param.thisObject, "button").setLoading(False)
-            except Exception:
-                pass
-            self.plugin._show_error("PREMIUM_UNAVAILABLE")
+        if not self.plugin._visual_enabled():
+            return
+        param.setResult(None)
+        sheet = param.thisObject
+        callback = SheetGiftCallback(self.plugin, sheet)
+        try:
+            account = int(get_private_field(sheet, "currentAccount"))
+            gift = get_private_field(sheet, "starGift")
+            if get_private_field(sheet, "upgrade"):
+                raise ApiError("UPGRADE_UNAVAILABLE")
+            message = self.message_method.invoke(sheet)
+            recipient = int(get_private_field(sheet, "dialogId"))
+            anonymous = bool(get_private_field(sheet, "anonymous"))
+            body = gift_payload(gift, recipient, message, anonymous, int(gift.stars), "XTR")
+            self.plugin._send_visual(account, body, callback)
+        except Exception as error:
+            self.plugin._gift_callback(callback, False)
+            self.plugin._show_error(getattr(error, "code", "UNSUPPORTED_GIFT"))
+
+class PremiumGiftHook(MethodHook):
+    def __init__(self, plugin, sheet=False):
+        self.plugin, self.sheet = plugin, sheet
+
+    def before_hooked_method(self, param):
+        if not self.plugin._visual_enabled():
+            return
+        if self.sheet:
+            clazz = param.thisObject.getClass()
+            while clazz is not None and str(clazz.getName()) != "org.telegram.ui.Gifts.SendGiftSheet":
+                clazz = clazz.getSuperclass()
+            if clazz is None or get_private_field(param.thisObject, "premiumTier") is None:
+                return
+        param.setResult(None)
+        try:
+            get_private_field(param.thisObject, "button").setLoading(False)
+        except Exception:
+            pass
+        self.plugin._show_error("PREMIUM_UNAVAILABLE")
 
 class GiftBalanceHook(MethodHook):
     def __init__(self, plugin, intro):
@@ -460,6 +524,7 @@ class VisuGramPlugin(BasePlugin):
         self._native, self._warned = False, False
         self._span_fragments = None
         self._gift_native, self._gift_busy, self._payment_guard = False, {}, False
+        self._gift_resale, self._gift_diagnostics = False, []
         self._gift_page_state, self._gift_page_busy = None, None
 
     def on_plugin_load(self):
@@ -471,7 +536,7 @@ class VisuGramPlugin(BasePlugin):
         self._gift_page_busy = None
         self._install_native()
         self._install_gifts()
-        if self.get_setting("visual_gifts", False) and not self._payment_guard:
+        if self.get_setting("visual_gifts", False) and (not self._payment_guard or not self._gift_native):
             self.set_setting("visual_gifts", False)
         self._restart()
 
@@ -544,63 +609,114 @@ class VisuGramPlugin(BasePlugin):
     def _visual_enabled(self):
         return self._loaded and self.get_setting("visual_gifts", False)
 
-    def _install_gifts(self):
-        self._gift_native, self._payment_guard = False, False
+    def _gift_hook_issue(self, label, detail):
+        line = label + ": " + str(detail).replace("\n", " ").replace("\r", " ")[:180]
+        if line not in self._gift_diagnostics:
+            self._gift_diagnostics = (self._gift_diagnostics + [line])[-12:]
+        self.log("VisuGram " + line)
+
+    def _gift_hook(self, label, class_name, name, arguments, handler):
         try:
-            for name in PAYMENT_REQUESTS:
-                self.add_hook(name)
-            for name in GIFT_MUTATIONS:
-                self.add_hook(name)
+            method = find_method(class_name, name, arguments)
+            if method is None:
+                clazz = reflection_class(class_name)
+                signatures = []
+                while clazz is not None and len(signatures) < 2:
+                    for candidate in clazz.getDeclaredMethods():
+                        if str(candidate.getName()) == name:
+                            types = [str(value.getName()).rsplit(".", 1)[-1] for value in candidate.getParameterTypes()]
+                            signatures.append("(" + ", ".join(types) + ")")
+                    clazz = clazz.getSuperclass()
+                detail = "method not found" if not signatures else "unsupported signature: " + "; ".join(signatures[:2])
+                self._gift_hook_issue(label, detail)
+                return False
+            if not self.hook_method(method, handler):
+                self._gift_hook_issue(label, "SDK did not install the hook")
+                return False
+            return True
+        except Exception as error:
+            self._gift_hook_issue(label, type(error).__name__ + ": " + str(error))
+            return False
+
+    def _install_gifts(self):
+        self._gift_native, self._payment_guard, self._gift_resale = False, False, False
+        self._gift_diagnostics = []
+        try:
+            for name in (*PAYMENT_REQUESTS, *GIFT_MUTATIONS):
+                self.add_hook(name, match_substring=True)
             self._payment_guard = True
-            buy = find_method("org.telegram.ui.Stars.StarsController", "buyStarGift", [
-                "org.telegram.tgnet.tl.TL_stars$StarGift", "boolean", "boolean", "long",
-                "org.telegram.tgnet.TLRPC$TL_textWithEntities", "org.telegram.messenger.Utilities$Callback2",
-            ])
-            resale = find_method("org.telegram.ui.Stars.StarsController", "buyResellingGift", [
-                "org.telegram.tgnet.TLRPC$TL_payments_paymentFormStarGift", "org.telegram.tgnet.tl.TL_stars$StarGift",
-                "long", "org.telegram.messenger.Utilities$Callback2",
-            ])
-            resale_message = find_method("org.telegram.ui.Stars.StarsController", "buyResellingGift", [
-                "org.telegram.tgnet.TLRPC$TL_payments_paymentFormStarGift", "org.telegram.tgnet.tl.TL_stars$StarGift",
-                "long", "org.telegram.tgnet.TLRPC$TL_textWithEntities", "boolean",
-                "org.telegram.messenger.Utilities$Callback2",
-            ])
-            if buy is None:
-                return
-            premium = find_method("org.telegram.ui.Gifts.SendGiftSheet", "buyPremiumTier", [])
-            if premium is None:
-                return
-            hooks = []
+        except Exception as error:
+            self._gift_hook_issue("Payment protection", type(error).__name__ + ": " + str(error))
+            return
+        controller, sheet = "org.telegram.ui.Stars.StarsController", "org.telegram.ui.Gifts.SendGiftSheet"
+        buy = self._gift_hook("StarsController.buyStarGift", controller, "buyStarGift", [
+            "org.telegram.tgnet.tl.TL_stars$StarGift", "boolean", "boolean", "long",
+            "org.telegram.tgnet.TLRPC$TL_textWithEntities", "org.telegram.messenger.Utilities$Callback2",
+        ], GiftBuyHook(self))
+        if not buy:
             try:
-                hooks.append(self.hook_method(buy, GiftBuyHook(self)))
-                hooks.append(self.hook_method(premium, PremiumGiftHook(self)))
-                for method in (resale, resale_message):
-                    if method is not None:
-                        hooks.append(self.hook_method(method, GiftBuyHook(self, True)))
-                if not all(hooks):
-                    raise ValueError("HOOK_UNAVAILABLE")
-                self._gift_native = True
-                for class_name, name, args, intro in (
-                    ("org.telegram.ui.Stars.StarsIntroActivity", "updateBalance", [], True),
-                    ("org.telegram.ui.Gifts.SendGiftSheet", "setButtonText", ["boolean"], False),
-                ):
-                    method = find_method(class_name, name, args)
-                    if method is not None:
-                        self.hook_method(method, GiftBalanceHook(self, intro))
-            except Exception:
-                self._gift_native = False
-                for hook in hooks:
-                    if hook:
-                        self.unhook_method(hook)
-                raise
+                message = find_method(sheet, "getMessage", [])
+                if message is not None:
+                    buy = self._gift_hook("SendGiftSheet.buyStarGift", sheet, "buyStarGift", [], SheetGiftBuyHook(self, message))
+                else:
+                    self._gift_hook_issue("SendGiftSheet.getMessage", "method not found")
+            except Exception as error:
+                self._gift_hook_issue("SendGiftSheet.getMessage", type(error).__name__ + ": " + str(error))
+        premium = self._gift_hook("SendGiftSheet.buyPremiumTier", sheet, "buyPremiumTier", [], PremiumGiftHook(self))
+        if not premium:
+            premium = self._gift_hook("SendGiftSheet.show", sheet, "show", [], PremiumGiftHook(self, sheet=True))
+        resale_base = ["org.telegram.tgnet.TLRPC$TL_payments_paymentFormStarGift", "org.telegram.tgnet.tl.TL_stars$StarGift", "long"]
+        for suffix in (["org.telegram.messenger.Utilities$Callback2"], ["org.telegram.tgnet.TLRPC$TL_textWithEntities",
+                       "boolean", "org.telegram.messenger.Utilities$Callback2"]):
+            ready = self._gift_hook("StarsController.buyResellingGift(" + str(len(resale_base + suffix)) + ")",
+                                    controller, "buyResellingGift", resale_base + suffix, GiftBuyHook(self, True))
+            self._gift_resale = self._gift_resale or ready
+        self._gift_native = buy and premium
+        for class_name, name, args, intro in (
+            ("org.telegram.ui.Stars.StarsIntroActivity", "updateBalance", [], True),
+            (sheet, "setButtonText", ["boolean"], False),
+        ):
+            self._gift_hook(name, class_name, name, args, GiftBalanceHook(self, intro))
+
+    def _gift_report(self):
+        lines = ["VisuGram " + __version__]
+        try:
+            from org.telegram.messenger import BuildVars
+
+            lines.append("Client " + str(BuildVars.BUILD_VERSION_STRING) + " (" + str(BuildVars.BUILD_VERSION) + ")")
         except Exception:
-            self.log("VisuGram gift hooks are unavailable for this client version.")
+            pass
+        try:
+            from _sdk_version import __version__ as sdk_version
+
+            lines.append("SDK " + str(sdk_version))
+        except ImportError:
+            pass
+        for title, ready in ((self._text("Payment protection", "Защита платежей"), self._payment_guard),
+                             (self._text("Ordinary gifts", "Обычные подарки"), self._gift_native),
+                             (self._text("Collectibles", "Коллекционные"), self._gift_resale and self._gift_native)):
+            status = self._text("ready", "готово") if ready else self._text("unavailable", "недоступно")
+            lines.append(title + ": " + status)
+        lines.extend(self._gift_diagnostics[:12])
+        return "\n".join(lines)
+
+    def _show_gift_report(self):
+        fragment = get_last_fragment()
+        if fragment is None or fragment.getParentActivity() is None:
+            self._show_error("GIFT_HOOK_UNAVAILABLE")
+            return
+        dialog = AlertDialogBuilder(fragment.getParentActivity())
+        dialog.set_title(self._text("Gift compatibility", "Совместимость подарков"))
+        dialog.set_message(self._gift_report())
+        dialog.set_positive_button("OK", lambda builder, index: builder.dismiss())
+        dialog.show()
 
     def pre_request_hook(self, request_name, account, request):
         reference = getattr(request, "stargift", None)
         virtual_reference = reference is not None and (
             int(getattr(reference, "msg_id", 0)) < 0 or int(getattr(reference, "saved_id", 0)) < 0)
-        if virtual_reference or (self._visual_enabled() and request_name in (*PAYMENT_REQUESTS, *GIFT_MUTATIONS)):
+        protected = any(str(request_name).startswith(name) for name in (*PAYMENT_REQUESTS, *GIFT_MUTATIONS))
+        if virtual_reference or (self._visual_enabled() and protected):
             run_on_ui_thread(lambda: self._show_error("REAL_PAYMENT_BLOCKED"))
             return HookResult(strategy=HookStrategy.CANCEL)
         return HookResult()
@@ -608,7 +724,7 @@ class VisuGramPlugin(BasePlugin):
     def _gift_toggle(self, enabled):
         if enabled and (not self._gift_native or not self._payment_guard):
             self.set_setting("visual_gifts", False, reload_settings=True)
-            self._show_error("GIFT_HOOK_UNAVAILABLE")
+            self._show_gift_report()
             return
         self.set_setting("visual_gifts", bool(enabled), reload_settings=True)
 
@@ -694,8 +810,14 @@ class VisuGramPlugin(BasePlugin):
         BulletinHelper.show_info(self._text("Visual gift sent.", "Визуальный подарок отправлен."))
 
     def _open_shop(self):
-        if not self._visual_enabled() or not self._gift_native or not self._running(self._generation):
-            self._show_error("GIFT_HOOK_UNAVAILABLE" if not self._gift_native else "SYNC_DISABLED")
+        if not self._gift_native:
+            self._show_gift_report()
+            return
+        if not self._visual_enabled():
+            self._show_error("VISUAL_DISABLED")
+            return
+        if not self._running(self._generation):
+            self._show_error("SYNC_DISABLED")
             return
         try:
             from org.telegram.ui.Gifts import GiftSheet
@@ -705,8 +827,9 @@ class VisuGramPlugin(BasePlugin):
             user = get_user_config(account).getCurrentUser()
             if fragment is not None and user is not None and fragment.getParentActivity() is not None:
                 GiftSheet(fragment.getParentActivity(), account, int(user.id), None).show()
-        except Exception:
-            self._show_error("GIFT_HOOK_UNAVAILABLE")
+        except Exception as error:
+            self._gift_hook_issue("GiftSheet.show", type(error).__name__ + ": " + str(error))
+            self._show_gift_report()
 
     def _load_gift_page(self, direction="received", offset="", cursor="", owner=None):
         generation, account = self._generation, int(UserConfig.selectedAccount)
@@ -905,6 +1028,8 @@ class VisuGramPlugin(BasePlugin):
                  on_click=lambda view: self._load_gift_page()),
             Text(text=self._text("Sent gifts", "Отправленные подарки"),
                  on_click=lambda view: self._load_gift_page("sent")),
+            Text(text=self._text("Gift compatibility", "Совместимость подарков"),
+                 on_click=lambda view: self._show_gift_report()),
         ]
         page = self._gift_page_state
         if page is not None and user is not None and page["user_id"] == str(user.id):
@@ -1232,6 +1357,7 @@ class VisuGramPlugin(BasePlugin):
     def _show_error(self, code):
         messages = {
             "SYNC_DISABLED": ("Enable synchronization first.", "Сначала включи синхронизацию."),
+            "VISUAL_DISABLED": ("Enable visual purchases first.", "Сначала включи визуальные покупки."),
             "INVALID_USERNAME": ("One username per line, without spaces or duplicates.", "Один юзернейм на строку, без пробелов и повторов."),
             "INVALID_PHONE": ("Enter 1–8 digits after +888.", "Введи от 1 до 8 цифр после +888."),
             "PHONE_NOT_FOUND": ("This +888 number was not found on Fragment.", "Этот номер +888 не найден на Fragment."),
