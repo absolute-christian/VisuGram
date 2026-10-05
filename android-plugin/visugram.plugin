@@ -10,30 +10,40 @@ from decimal import Decimal
 from android_utils import run_on_ui_thread
 from base_plugin import AppEvent, BasePlugin, MethodHook
 from client_utils import (
-    EXTERNAL_NETWORK_QUEUE, get_last_fragment, get_messages_controller,
-    get_user_config, run_on_queue,
+    EXTERNAL_NETWORK_QUEUE, get_last_fragment, run_on_queue,
 )
 from hook_utils import find_class, get_private_field
 from java.util import Locale
-from org.telegram.messenger import UserConfig
+from org.telegram.messenger import MessagesController, UserConfig
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from ui.settings import Divider, EditText, Header, Input, Switch, Text
+from ui.settings import Divider, Header, Input, Switch, Text
+
+try:
+    from ui.settings import EditText
+except ImportError:
+    EditText = None
 
 __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual usernames and anonymous numbers. Gift port in development."
 __author__ = "VisuGram"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
-__sdk_version__ = ">=1.4.5.7"
+__sdk_version__ = ">=1.4.0"
 
 SERVER = "https://visugram-api-production.up.railway.app"
 POLL_MS = 30_000
 REMOTE_LIMIT = 32
 MAX_RESPONSE = 256 * 1024
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+def get_user_config(account):
+    return UserConfig.getInstance(account)
+
+def get_messages_controller(account):
+    return MessagesController.getInstance(account)
 
 class ApiError(Exception):
     def __init__(self, code):
@@ -110,7 +120,7 @@ def sync_profile(user_id, username, cached):
             "gift_count": count, "updated_at": int(time.time())}
 
 def parse_names(value):
-    names = [line.strip().lstrip("@").lower() for line in value.splitlines() if line.strip()]
+    names = [line.strip().lstrip("@").lower() for line in re.split(r"[\r\n,]+", value) if line.strip()]
     if len(names) > 20 or any(not NAME_RE.fullmatch(name) for name in names) or len(set(names)) != len(names):
         raise ApiError("INVALID_USERNAME")
     return names
@@ -159,6 +169,17 @@ class ProfileClickHook(MethodHook):
         except Exception:
             self.plugin._native_error()
 
+class AssetClickHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if self.plugin._click_asset_span(param):
+                param.setResult(None)
+        except Exception:
+            self.plugin._native_error()
+
 class VisuGramPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -167,6 +188,7 @@ class VisuGramPlugin(BasePlugin):
         self._busy, self._saving, self._snapshots = {}, {}, {}
         self._remote, self._remote_busy = OrderedDict(), {}
         self._native, self._warned = False, False
+        self._span_fragments = None
 
     def on_plugin_load(self):
         self._generation = getattr(self, "_generation", 0) + 1
@@ -183,6 +205,8 @@ class VisuGramPlugin(BasePlugin):
         self._remote.clear()
         self._snapshots.clear()
         self._rebind_visible()
+        if self._span_fragments is not None:
+            self._span_fragments.clear()
 
     def on_app_event(self, event_type):
         if not getattr(self, "_loaded", False):
@@ -200,7 +224,7 @@ class VisuGramPlugin(BasePlugin):
     def _native_error(self):
         if not self._warned:
             self._warned = True
-            self.logger.warning("VisuGram profile hook is unavailable for this client version.")
+            self.log("VisuGram profile hook is unavailable for this client version.")
 
     def _install_native(self):
         try:
@@ -210,35 +234,23 @@ class VisuGramPlugin(BasePlugin):
             click = find_method("org.telegram.ui.ProfileActivity", "processOnClickOrPress", [
                 "int", "android.view.View", "float", "float",
             ])
+            link = find_method("org.telegram.ui.Components.URLSpanNoUnderline", "onClick", [
+                "android.view.View",
+            ])
         except Exception:
             self._native_error()
             return
-        if bind is None or click is None:
+        if bind is None or click is None or link is None:
             self._native_error()
             return
         hooks = []
         try:
-            from android.text.style import ClickableSpan
-            from extera_utils.classes import Base, java_subclass, joverride
+            from java.util import WeakHashMap
 
-            @java_subclass(ClickableSpan)
-            class AssetSpan(Base):
-                def __init__(self, plugin, fragment_ref, kind, value):
-                    self.plugin, self.fragment_ref = plugin, fragment_ref
-                    self.kind, self.value = kind, value
-
-                @joverride("onClick", ["android.view.View"])
-                def onClick(self, view):
-                    fragment = self.fragment_ref.get()
-                    if fragment is not None:
-                        try:
-                            self.plugin._open_asset(fragment, self.kind, self.value)
-                        except Exception:
-                            self.plugin._native_error()
-
-            self._span_type = AssetSpan
+            self._span_fragments = WeakHashMap()
             hooks.append(self.hook_method(bind, ProfileBindHook(self)))
             hooks.append(self.hook_method(click, ProfileClickHook(self)))
+            hooks.append(self.hook_method(link, AssetClickHook(self)))
             if not all(hooks):
                 raise ValueError("HOOK_UNAVAILABLE")
             self._native = True
@@ -393,20 +405,38 @@ class VisuGramPlugin(BasePlugin):
 
     def _name_text(self, fragment, names, profile):
         from android.text import SpannableStringBuilder
-        from android.text.style import URLSpan
         from java.lang.ref import WeakReference
+        from org.telegram.ui.Components import URLSpanNoUnderline
 
         text = ", ".join("@" + name for name in names)
         result, offset = SpannableStringBuilder(text), 0
         for name in names:
             value = "@" + name
             if name in profile["usernames"]:
-                span = self._span_type.new_instance(init_args=[self, WeakReference(fragment), "username", name]).java
+                span = URLSpanNoUnderline("https://fragment.com/username/" + name)
+                self._span_fragments.put(span, WeakReference(fragment))
             else:
-                span = URLSpan("https://t.me/" + name)
+                span = URLSpanNoUnderline("https://t.me/" + name)
             result.setSpan(span, offset, offset + len(value), 33)
             offset += len(value) + 2
         return result
+
+    def _click_asset_span(self, param):
+        if not self._native or not self._running(self._generation):
+            return False
+        reference = self._span_fragments.get(param.thisObject)
+        if reference is None:
+            return False
+        fragment = reference.get()
+        prefix = "https://fragment.com/username/"
+        url = str(param.thisObject.getURL())
+        if fragment is None or not url.startswith(prefix):
+            return False
+        name = url[len(prefix):]
+        profile = self._profile_for(fragment)
+        if profile is None or name not in profile["usernames"]:
+            return False
+        return self._open_asset(fragment, "username", name)
 
     def _bind_profile(self, param):
         if not self._native or not self._running(self._generation):
@@ -624,10 +654,17 @@ class VisuGramPlugin(BasePlugin):
                 self.set_setting(key, default)
         if self.get_setting("draft_revision:" + user_id, None) is None:
             self.set_setting("draft_revision:" + user_id, profile["revision"])
+        names_field = (
+            EditText(key=keys[0], hint=self._text("@username — one per line", "@username — один на строку"),
+                     default=defaults[0], multiline=True, max_length=660)
+            if EditText is not None else
+            Input(key=keys[0], text=self._text("Visual usernames", "Визуальные юзернеймы"),
+                  default=defaults[0].replace("\n", ", "),
+                  subtext=self._text("Separate usernames with commas.", "Разделяй юзернеймы запятыми."))
+        )
         return [
             Header(text=self._text("Visual profile", "Визуальный профиль")),
-            EditText(key=keys[0], hint=self._text("@username — one per line", "@username — один на строку"),
-                     default=defaults[0], multiline=True, max_length=660),
+            names_field,
             Input(key=keys[1], text=self._text("Phone number +888", "Номер телефона +888"), default=defaults[1],
                   subtext=self._text("Only digits after +888. Empty field removes the visual number.",
                                      "Только цифры после +888. Пустое поле убирает визуальный номер.")),

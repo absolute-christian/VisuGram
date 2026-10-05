@@ -1,4 +1,6 @@
 import importlib.util
+from importlib.machinery import SourceFileLoader
+import ast
 import json
 import sys
 import types
@@ -19,7 +21,9 @@ def module(name, **values):
 class BasePlugin:
     def __init__(self):
         self.settings, self.writes = {}, []
-        self.logger = types.SimpleNamespace(warning=lambda text: None)
+
+    def log(self, text):
+        pass
 
     def get_setting(self, key, default=None):
         return self.settings.get(key, default)
@@ -35,6 +39,10 @@ class Setting:
 class UserConfig:
     selectedAccount = 0
 
+    @staticmethod
+    def getInstance(account):
+        return types.SimpleNamespace(getCurrentUser=lambda: USERS.get(account))
+
 class AppEvent:
     START, STOP, PAUSE, RESUME = range(4)
 
@@ -45,17 +53,17 @@ for name in ("java", "org", "org.telegram", "ui"):
     module(name)
 module("android_utils", run_on_ui_thread=run_ui)
 module("base_plugin", AppEvent=AppEvent, BasePlugin=BasePlugin, MethodHook=object)
-module("client_utils", EXTERNAL_NETWORK_QUEUE="external",
-       get_last_fragment=lambda: VISIBLE, get_messages_controller=lambda account: CONTROLLERS[account],
-       get_user_config=lambda account: types.SimpleNamespace(getCurrentUser=lambda: USERS.get(account)),
+module("client_utils", EXTERNAL_NETWORK_QUEUE="external", get_last_fragment=lambda: VISIBLE,
        run_on_queue=lambda fn, queue: NETWORK.append(fn))
 module("hook_utils", find_class=lambda name: None, get_private_field=lambda obj, name: getattr(obj, name, None))
 module("java.util", Locale=types.SimpleNamespace(getDefault=lambda: types.SimpleNamespace(getLanguage=lambda: "en")))
-module("org.telegram.messenger", UserConfig=UserConfig)
+module("org.telegram.messenger", UserConfig=UserConfig,
+       MessagesController=types.SimpleNamespace(getInstance=lambda account: CONTROLLERS[account]))
 module("ui.alert", AlertDialogBuilder=object)
 module("ui.bulletin", BulletinHelper=types.SimpleNamespace(show_info=lambda text: None))
-module("ui.settings", **{name: Setting for name in ("Divider", "EditText", "Header", "Input", "Switch", "Text")})
-spec = importlib.util.spec_from_file_location("visugram", Path(__file__).parents[1] / "visugram.py")
+module("ui.settings", **{name: Setting for name in ("Divider", "Header", "Input", "Switch", "Text")})
+source = Path(__file__).parents[1] / "visugram.plugin"
+spec = importlib.util.spec_from_loader("visugram", SourceFileLoader("visugram", str(source)))
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 
@@ -160,6 +168,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_short_usernames_and_phone_prefix(self):
         self.assertEqual(plugin.parse_names("@dev\n own\n"), ["dev", "own"])
+        self.assertEqual(plugin.parse_names("@dev, own\nthird"), ["dev", "own", "third"])
         self.assertEqual(plugin.phone_from_suffix(" 8 666 "), "+8888666")
         self.assertEqual(plugin.phone_from_suffix(""), "")
         for value in ("dev\nDEV", "has space", "кириллица", "bad!", "0user"):
@@ -246,6 +255,48 @@ class ProfileTests(unittest.TestCase):
         with patch.object(self.subject, "_rebind_visible") as redraw:
             self.subject._remote_finish(0, key, self.subject._generation, dict(profile))
         redraw.assert_not_called()
+
+    def test_plugin_metadata_accepts_sdk_140(self):
+        values = {node.targets[0].id: ast.literal_eval(node.value)
+                  for node in ast.parse(source.read_text(encoding="utf-8")).body
+                  if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                  and node.targets[0].id.startswith("__")}
+        self.assertEqual(source.suffix, ".plugin")
+        self.assertEqual(values["__sdk_version__"], ">=1.4.0")
+        self.assertEqual(values["__version__"], "0.2.1")
+
+    def test_legacy_editor_without_edittext_or_logger(self):
+        self.assertIsNone(plugin.EditText)
+        self.assertFalse(hasattr(self.subject, "logger"))
+        self.subject._snapshots["101"] = snapshot()
+        fields = self.subject._editor()
+        names = fields[1]
+        self.assertEqual(names.key, "draft_names:101")
+        self.assertIn("commas", names.subtext)
+        self.subject.settings[names.key] = "dev, own"
+        self.assertEqual(plugin.parse_names(self.subject.get_setting(names.key)), ["dev", "own"])
+
+    def test_modern_editor_still_supports_multiple_lines(self):
+        with patch.object(plugin, "EditText", Setting):
+            field = self.subject._editor()[1]
+        self.assertTrue(field.multiline)
+        self.assertEqual(field.max_length, 660)
+
+    def test_asset_span_hook_ignores_unregistered_links(self):
+        self.subject.settings["sync_enabled"] = True
+        self.subject._native = True
+        registered = object()
+        span = types.SimpleNamespace(getURL=lambda: "https://fragment.com/username/dev")
+        reference = types.SimpleNamespace(get=lambda: registered)
+        self.subject._span_fragments = types.SimpleNamespace(get=lambda value: reference if value is span else None)
+        with patch.object(self.subject, "_profile_for", return_value=snapshot()["profile"]), \
+             patch.object(self.subject, "_open_asset", return_value=True) as opened:
+            self.assertFalse(self.subject._click_asset_span(types.SimpleNamespace(thisObject=object())))
+            opened.assert_not_called()
+            self.assertTrue(self.subject._click_asset_span(types.SimpleNamespace(thisObject=span)))
+            opened.assert_called_once_with(registered, "username", "dev")
+        self.subject.settings["sync_enabled"] = False
+        self.assertFalse(self.subject._click_asset_span(types.SimpleNamespace(thisObject=span)))
 
 if __name__ == "__main__":
     unittest.main()
