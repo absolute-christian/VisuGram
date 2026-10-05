@@ -321,6 +321,15 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 			prefix->moveToLeft(margins.left(), margins.top());
 		}
 		const auto saving = box->lifetime().make_state<bool>(false);
+		box->addRow(object_ptr<Ui::FlatLabel>(
+			box, SyncStatusValue(session), st::boxLabel), st::boxRowPadding);
+		const auto status = box->lifetime().make_state<rpl::variable<QString>>();
+		box->addRow(object_ptr<Ui::FlatLabel>(
+			box, status->value(), st::boxLabel), st::boxRowPadding);
+		const auto showError = [=](QString code) {
+			field->showError();
+			*status = SyncError(code);
+		};
 		box->addButton(tr::lng_settings_save(), [=] {
 			if (*saving) {
 				return;
@@ -332,23 +341,21 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 				? initialNames.value(0) : QString();
 			if (editPhone) {
 				if (!QRegularExpression(u"^[+0-9 ()-]*$"_q).match(text).hasMatch()) {
-					field->showError();
+					showError(u"INVALID_PHONE"_q);
 					return;
 				}
 				phone = text;
 				phone.remove(QRegularExpression(u"[^0-9]"_q));
 				if (text.startsWith('+') || phone.size() > 8) {
 					if (!phone.startsWith(u"888")) {
-						field->showError();
-						window->showToast(SyncError(u"INVALID_PHONE"_q));
+						showError(u"INVALID_PHONE"_q);
 						return;
 					}
 					phone.remove(0, 3);
 				}
 				if (!phone.isEmpty()) {
 					if (!QRegularExpression(u"^[0-9]{1,8}$"_q).match(phone).hasMatch()) {
-						field->showError();
-						window->showToast(SyncError(u"INVALID_PHONE"_q));
+						showError(u"INVALID_PHONE"_q);
 						return;
 					}
 					phone.prepend(u"+888"_q);
@@ -368,8 +375,7 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 					}
 					if (!pattern.match(name).hasMatch()
 						|| seen.contains(name) || seen.size() >= 20) {
-						field->showError();
-						window->showToast(SyncError(u"INVALID_USERNAME"_q));
+						showError(u"INVALID_USERNAME"_q);
 						return;
 					}
 					const auto native = ranges::any_of(session->user()->usernames(),
@@ -384,10 +390,11 @@ void EditProfile(not_null<Window::SessionController*> window, bool editPhone) {
 				}
 			}
 			*saving = true;
+			*status = Text(u"Saving…"_q, u"Сохранение…"_q);
 			SaveProfile(session, phone, names, primary, crl::guard(box, [=](QString error) {
 				*saving = false;
 				if (!error.isEmpty()) {
-					window->showToast(SyncError(error));
+					showError(std::move(error));
 					return;
 				}
 				box->closeBox();
@@ -612,6 +619,8 @@ void ShowSyncSettings(not_null<Window::SessionController*> window) {
 			box, st::defaultInputField, Ui::InputField::Mode::SingleLine,
 			rpl::single(u"https://…"_q), SyncServer(session)), st::boxRowPadding);
 		field->setMaxLength(512);
+		box->addRow(object_ptr<Ui::FlatLabel>(
+			box, SyncStatusValue(session), st::boxLabel), st::boxRowPadding);
 		box->addLeftButton(TextValue(u"Default server"_q, u"По умолчанию"_q), [=] {
 			field->setText(DefaultSyncServer());
 		});

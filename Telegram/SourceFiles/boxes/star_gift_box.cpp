@@ -5336,7 +5336,7 @@ void SendGiftBox(
 				state->submitting = false;
 				return;
 			}
-			const auto input = details.text.text
+			const auto input = Ayu::Visual::EncodeGiftMessage(session, details.text)
 				+ (details.anonymous ? '1' : '0');
 			if (state->operation.isEmpty() || state->lastInput != input) {
 				state->operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -5346,7 +5346,7 @@ void SendGiftBox(
 				peer,
 				stars->info.id,
 				QString(),
-				details.text.text,
+				details.text,
 				details.anonymous,
 				CreditsAmount(std::max(int64(0), stars->info.stars)),
 				state->operation,
@@ -5361,7 +5361,11 @@ void SendGiftBox(
 					window->hideLayer();
 					window->showPeerHistory(peer,
 						Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
-					ShowSentToast(window, details.descriptor, details);
+					if (error.isEmpty()) {
+						ShowSentToast(window, details.descriptor, details);
+					} else {
+						window->showToast(Ayu::Visual::SyncError(error));
+					}
 					StartFireworks(window->widget());
 				}));
 			return;

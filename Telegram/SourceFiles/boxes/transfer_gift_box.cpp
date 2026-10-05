@@ -1289,9 +1289,10 @@ void ShowBuyResaleGiftBox(
 			}
 			if (visual) {
 				state->submitting = true;
-				const auto text = state->message.current().text;
+				const auto text = state->message.current();
 				const auto anonymous = state->hideName.current();
-				const auto input = text + (anonymous ? '1' : '0');
+				const auto input = Ayu::Visual::EncodeGiftMessage(session, text)
+					+ (anonymous ? '1' : '0');
 				if (state->operation.isEmpty() || state->lastInput != input) {
 					state->operation = QUuid::createUuid().toString(QUuid::WithoutBraces);
 					state->lastInput = input;
@@ -1322,7 +1323,11 @@ void ShowBuyResaleGiftBox(
 							window->hideLayer();
 							window->showPeerHistory(to,
 								Window::SectionShow::Way::ClearStack, ShowAtTheEndMsgId);
-							Ui::ShowResaleGiftBoughtToast(show, to, *gift);
+							if (error.isEmpty()) {
+								Ui::ShowResaleGiftBoughtToast(show, to, *gift);
+							} else {
+								show->showToast(Ayu::Visual::SyncError(error));
+							}
 							Ui::StartFireworks(window->widget());
 						}
 					}));

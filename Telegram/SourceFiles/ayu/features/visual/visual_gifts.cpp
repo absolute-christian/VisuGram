@@ -1,6 +1,7 @@
 #include "ayu/features/visual/visual_gifts.h"
 
 #include "api/api_premium.h"
+#include "api/api_text_entities.h"
 #include "base/unixtime.h"
 #include "data/components/credits.h"
 #include "data/data_changes.h"
@@ -119,6 +120,7 @@ public:
 	PeerId watchedPeer;
 	bool syncing = false;
 	bool profileSaving = false;
+	rpl::variable<QString> syncStatus = u"CONNECTING"_q;
 	Fn<void()> pendingProfileSave;
 	int requestsLoading = 0;
 
@@ -128,15 +130,17 @@ private:
 
 };
 
-[[nodiscard]] QByteArray Encode(const MTPStarGift &gift) {
+template <typename Type>
+[[nodiscard]] QByteArray Encode(const Type &value) {
 	auto buffer = mtpBuffer();
-	gift.write(buffer);
+	value.write(buffer);
 	return QByteArray(
 		reinterpret_cast<const char*>(buffer.data()),
 		buffer.size() * sizeof(mtpPrime)).toBase64();
 }
 
-[[nodiscard]] std::optional<MTPStarGift> Decode(const QByteArray &encoded) {
+template <typename Type = MTPStarGift>
+[[nodiscard]] std::optional<Type> Decode(const QByteArray &encoded) {
 	const auto bytes = QByteArray::fromBase64(encoded);
 	if (bytes.isEmpty()
 		|| bytes.size() % sizeof(mtpPrime)
@@ -147,18 +151,32 @@ private:
 	memcpy(buffer.data(), bytes.constData(), bytes.size());
 	auto from = static_cast<const mtpPrime*>(buffer.data());
 	const auto end = from + buffer.size();
-	auto gift = MTPStarGift();
-	if (!gift.read(from, end) || from != end) {
+	auto value = Type();
+	if (!value.read(from, end) || from != end) {
 		return {};
 	}
-	return gift;
+	return value;
+}
+
+[[nodiscard]] TextWithEntities DecodeMessage(
+		not_null<Main::Session*> session,
+		const QJsonObject &object) {
+	const auto text = object.value(u"message"_q).toString();
+	const auto data = object.value(u"message_data"_q).toString().toLatin1();
+	if (const auto encoded = Decode<MTPTextWithEntities>(data)) {
+		auto message = Api::ParseTextWithEntities(session, *encoded);
+		if (message.text == text) {
+			return message;
+		}
+	}
+	return TextWithEntities{ text };
 }
 
 [[nodiscard]] Data::SavedStarGift LocalGift(
 		not_null<Main::Session*> session,
 		Data::StarGift info,
 		PeerId recipient,
-		QString message,
+		TextWithEntities message,
 		TimeId date,
 		bool anonymous) {
 	if (info.unique) {
@@ -173,14 +191,14 @@ private:
 			.senderId = anonymous ? PeerId() : session->userPeerId(),
 			.recipientId = recipient,
 			.date = date,
-			.message = TextWithEntities{ message },
+			.message = message,
 		};
 	}
 	return {
 		.info = std::move(info),
 		.manageId = Data::SavedStarGiftId::User(
 			session->data().nextLocalMessageId()),
-		.message = TextWithEntities{ std::move(message) },
+		.message = std::move(message),
 		.fromId = anonymous ? PeerId() : session->userPeerId(),
 		.date = date,
 		.anonymous = anonymous,
@@ -229,13 +247,17 @@ void State::load() {
 		return;
 	}
 	const auto savedEndpoint = root.value(u"sync_server"_q).toString();
-	endpoint = !savedEndpoint.isEmpty()
-		|| root.value(u"sync_server_configured"_q).toBool()
-		? savedEndpoint
-		: DefaultSyncServer();
+	endpoint = root.value(u"sync_disabled"_q).toBool()
+		? QString()
+		: savedEndpoint.isEmpty() ? DefaultSyncServer() : savedEndpoint;
 	cursor = root.value(u"sync_cursor"_q).toString();
 	ownProfile = root.value(u"sync_profile"_q).toObject();
 	serverGifts = root.value(u"server_gifts"_q).toArray();
+	if (endpoint != savedEndpoint) {
+		cursor.clear();
+		ownProfile = {};
+		serverGifts = {};
+	}
 	pendingServerGifts = serverGifts;
 	primary = root.value(u"primary"_q).toString();
 	phone = root.value(u"phone"_q).toString();
@@ -271,7 +293,7 @@ void State::loadRecords() {
 			session,
 			*parsed,
 			recipient,
-			object.value(u"message"_q).toString(),
+			DecodeMessage(session, object),
 			object.value(u"date"_q).toInt(),
 			object.value(u"anonymous"_q).toBool());
 		gift.pinned = object.value(u"pinned"_q).toBool() && gift.info.unique;
@@ -319,6 +341,7 @@ bool State::save() {
 			{ u"source"_q, QString::fromLatin1(record.encodedSource) },
 			{ u"recipient"_q, QString::number(record.recipient.value) },
 			{ u"message"_q, gift.message.text },
+			{ u"message_data"_q, EncodeGiftMessage(session, gift.message) },
 			{ u"date"_q, int(gift.date) },
 			{ u"anonymous"_q, gift.anonymous },
 			{ u"pinned"_q, gift.pinned },
@@ -336,6 +359,7 @@ bool State::save() {
 		{ u"enabled"_q, enabled.current() },
 		{ u"sync_server"_q, endpoint },
 		{ u"sync_server_configured"_q, true },
+		{ u"sync_disabled"_q, endpoint.isEmpty() },
 		{ u"sync_cursor"_q, cursor },
 		{ u"sync_profile"_q, ownProfile },
 		{ u"server_gifts"_q, serverGifts },
@@ -460,7 +484,7 @@ void State::restoreMessage(
 				peerToMTP(record.recipient),
 				MTP_int(gift.date),
 				MTP_textWithEntities(MTP_string(gift.message.text),
-					MTPVector<MTPMessageEntity>())));
+					Api::EntitiesToMTP(session, gift.message.entities))));
 			using GiftFlag = MTPDstarGiftUnique::Flag;
 			const auto local = MTP_starGiftUnique(
 				MTP_flags(GiftFlag::f_owner_id),
@@ -505,7 +529,7 @@ void State::restoreMessage(
 				MTP_int(0),
 				MTP_textWithEntities(
 					MTP_string(gift.message.text),
-					MTPVector<MTPMessageEntity>()));
+					Api::EntitiesToMTP(session, gift.message.entities)));
 		}
 		using Flag = MTPDmessageActionStarGift::Flag;
 		return MTP_messageActionStarGift(
@@ -515,7 +539,7 @@ void State::restoreMessage(
 				| (gift.message.empty() ? Flag() : Flag::f_message)),
 			record.source,
 			MTP_textWithEntities(MTP_string(gift.message.text),
-				MTPVector<MTPMessageEntity>()),
+				Api::EntitiesToMTP(session, gift.message.entities)),
 			MTP_long(0),
 			MTP_int(0),
 			MTP_long(0),
@@ -617,15 +641,23 @@ void State::request(
 }
 
 void State::sync() {
-	if (endpoint.isEmpty() || syncing || profileSaving) {
+	if (endpoint.isEmpty()) {
+		syncStatus = u"DISCONNECTED"_q;
+		return;
+	}
+	if (syncing || profileSaving) {
 		return;
 	}
 	syncing = true;
+	if (syncStatus.current() != u"CONNECTED") {
+		syncStatus = u"CONNECTING"_q;
+	}
 	request(u"/v1/sync"_q, {
 		{ u"cursor"_q, cursor },
 		{ u"telegram_username"_q, session->user()->editableUsername() },
 	}, [=](QJsonObject object, QString error) {
 		syncing = false;
+		syncStatus = error.isEmpty() ? u"CONNECTED"_q : error;
 		if (pendingProfileSave) {
 			QTimer::singleShot(0, &network, [this] {
 				if (const auto save = base::take(pendingProfileSave)) {
@@ -643,6 +675,7 @@ void State::sync() {
 		serverGifts = object.value(u"gifts"_q).toArray();
 		cursor = object.value(u"cursor"_q).toString();
 		if (!save()) {
+			syncStatus = u"STORAGE_ERROR"_q;
 			ownProfile = previousProfile;
 			serverGifts = previousGifts;
 			cursor = previousCursor;
@@ -776,7 +809,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 		return;
 	}
 	auto gift = LocalGift(session, *parsed, recipient,
-		object.value(u"message"_q).toString(),
+		DecodeMessage(session, object),
 		object.value(u"date"_q).toInt(),
 		object.value(u"anonymous"_q).toBool());
 	gift.fromId = gift.anonymous ? PeerId() : sender;
@@ -1143,6 +1176,22 @@ QString SyncServer(not_null<Main::Session*> session) {
 	return Get(session).endpoint;
 }
 
+rpl::producer<QString> SyncStatusValue(not_null<Main::Session*> session) {
+	return rpl::combine(
+		Get(session).syncStatus.value(),
+		TextValue(u"Synchronization"_q, u"Синхронизация"_q)
+	) | rpl::map([](const QString &status, const QString &label) {
+		const auto value = status == u"CONNECTED"
+			? Text(u"Connected"_q, u"Подключено"_q)
+			: status == u"CONNECTING"
+			? Text(u"Connecting…"_q, u"Подключение…"_q)
+			: status == u"DISCONNECTED"
+			? Text(u"Disconnected"_q, u"Отключено"_q)
+			: SyncError(status);
+		return label + u": "_q + value;
+	});
+}
+
 bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	endpoint = endpoint.trimmed();
 	while (endpoint.endsWith('/')) {
@@ -1158,6 +1207,7 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	}
 	auto &state = Get(session);
 	if (state.endpoint == endpoint) {
+		state.sync();
 		return true;
 	}
 	const auto previous = state.endpoint;
@@ -1165,6 +1215,9 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	if (!state.save()) {
 		state.endpoint = previous;
 		return false;
+	}
+	for (const auto reply : state.network.findChildren<QNetworkReply*>()) {
+		reply->abort();
 	}
 	for (const auto &record : state.records) {
 		if (!record.serverId.isEmpty()) {
@@ -1187,7 +1240,12 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	state.remoteAttempts.clear();
 	state.watchedPeer = PeerId();
 	state.restoredPeers.clear();
-	(void)state.save();
+	state.syncStatus = state.endpoint.isEmpty()
+		? u"DISCONNECTED"_q : u"CONNECTING"_q;
+	if (!state.save()) {
+		state.syncStatus = u"STORAGE_ERROR"_q;
+		return false;
+	}
 	state.notify();
 	QTimer::singleShot(0, &state.network, [&state] { state.sync(); });
 	return true;
@@ -1293,6 +1351,21 @@ QString SyncError(QString code) {
 	} else if (code == u"RECIPIENT_NOT_CONNECTED") {
 		return Text(u"The recipient has not connected to this VisuGram server yet."_q,
 			u"Получатель ещё не подключился к этому серверу VisuGram."_q);
+	} else if (code == u"LOCAL_ONLY") {
+		return Text(u"Gift saved only on this device. The recipient has not connected to this VisuGram server yet."_q,
+			u"Подарок сохранён только на этом устройстве. Получатель ещё не подключился к этому серверу VisuGram."_q);
+	} else if (code == u"SYNC_DISABLED") {
+		return Text(u"Gift saved only on this device. Synchronization is disabled."_q,
+			u"Подарок сохранён только на этом устройстве. Синхронизация отключена."_q);
+	} else if (code == u"RATE_LIMIT") {
+		return Text(u"Too many requests. Wait a minute and try again."_q,
+			u"Слишком много запросов. Подождите минуту и повторите попытку."_q);
+	} else if (code == u"DATABASE_UNAVAILABLE" || code == u"SERVER_ERROR") {
+		return Text(u"The server could not save your data. Try again later."_q,
+			u"Сервер не смог сохранить данные. Попробуйте позже."_q);
+	} else if (code == u"INVALID_MESSAGE") {
+		return Text(u"Could not read the gift comment."_q,
+			u"Не удалось прочитать комментарий к подарку."_q);
 	} else if (code == u"PROFILE_CHANGED") {
 		return Text(u"Your profile changed on another device. Reopen the editor."_q,
 			u"Профиль изменён на другом устройстве. Откройте редактор заново."_q);
@@ -1331,10 +1404,15 @@ void SaveProfile(
 	if (state.syncing) {
 		state.pendingProfileSave = [
 			&state,
+			endpoint = state.endpoint,
 			phone = std::move(phone),
 			names = std::move(names),
 			primary = std::move(primary),
 			done = std::move(done)]() mutable {
+			if (state.endpoint != endpoint) {
+				done(u"ENDPOINT_CHANGED"_q);
+				return;
+			}
 			SaveProfile(state.session, std::move(phone), std::move(names),
 				std::move(primary), std::move(done));
 		};
@@ -1388,11 +1466,19 @@ void RememberGiftSource(
 	state.giftSources.insert_or_assign(key, source);
 }
 
+QString EncodeGiftMessage(
+		not_null<Main::Session*> session,
+		const TextWithEntities &message) {
+	return QString::fromLatin1(Encode(MTP_textWithEntities(
+		MTP_string(message.text),
+		Api::EntitiesToMTP(session, message.entities))));
+}
+
 void SendGift(
 		not_null<PeerData*> recipient,
 		uint64 giftId,
 		QString slug,
-		QString message,
+		TextWithEntities message,
 		bool anonymous,
 		CreditsAmount price,
 		QString operation,
@@ -1448,7 +1534,7 @@ void SendGift(
 void SendGift(
 		not_null<PeerData*> recipient,
 		const MTPStarGift &source,
-		QString message,
+		TextWithEntities message,
 		bool anonymous,
 		CreditsAmount price,
 		QString operation,
@@ -1465,14 +1551,15 @@ void SendGift(
 	}
 	if (state.endpoint.isEmpty() && !info->unique) {
 		const auto gift = AddGift(recipient, source, std::move(message), anonymous, price);
-		done(gift, gift ? QString() : u"STORAGE_ERROR"_q);
+		done(gift, gift ? u"SYNC_DISABLED"_q : u"STORAGE_ERROR"_q);
 		return;
 	}
 	state.request(u"/v1/gifts"_q, {
 		{ u"recipient_id"_q, QString::number(peerToUser(recipient->id).bare) },
 		{ u"source"_q, QString::fromLatin1(Encode(source)) },
 		{ u"slug"_q, info->unique ? info->unique->slug : QString() },
-		{ u"message"_q, message },
+		{ u"message"_q, message.text },
+		{ u"message_data"_q, EncodeGiftMessage(state.session, message) },
 		{ u"anonymous"_q, anonymous },
 		{ u"price"_q, QString::number(price.ton()
 			? price.whole() * 1'000'000'000 + price.nano() : price.whole()) },
@@ -1494,7 +1581,7 @@ void SendGift(
 		if (object.value(u"local_only"_q).toBool()) {
 			const auto gift = AddGift(
 				recipient, source, std::move(message), anonymous, price, true);
-			done(gift, gift ? QString() : u"STORAGE_ERROR"_q);
+			done(gift, gift ? u"LOCAL_ONLY"_q : u"STORAGE_ERROR"_q);
 			return;
 		}
 		const auto value = object.value(u"gift"_q).toObject();
@@ -1801,7 +1888,7 @@ PeerId GiftRecipient(
 std::optional<Data::SavedStarGift> AddGift(
 		not_null<PeerData*> recipient,
 		const MTPStarGift &source,
-		QString message,
+		TextWithEntities message,
 		bool anonymous,
 		CreditsAmount price,
 		bool localOnly) {

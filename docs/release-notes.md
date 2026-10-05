@@ -4,11 +4,10 @@ VisuGram Windows x64
 
 В этом апдейте:
 
-- Визуальные подарки покупаются через штатные окна Telegram: каталог, коллекционные подарки, комментарий и анонимность.
-- Убрано отдельное окно визуальной покупки и повторная загрузка данных при выборе подарка. Реальные платежи за подарки блокируются в визуальном режиме.
-- Скрытые списки освобождают карточки с анимациями и перестают подгружать новые страницы.
-- Ограничен кэш номерных лент. Анимации 60 fps в визуальных списках используют штатный режим 30 fps.
-- Синхронизация пропускает обновление неизменного профиля. Поиск подарков в большой коллекции больше не перебирает весь список для каждой карточки.
+- Исправлено подключение к встроенному серверу после загрузки старых настроек.
+- В редакторе профиля видны статус синхронизации, ход сохранения и причины ошибок.
+- Отправка предупреждает, если подарок сохранён только на этом устройстве и получатель его не получит.
+- Премиум-эмодзи и форматирование комментариев сохраняются вместе с визуальным подарком.
 
 Основа — AyuGram 7.2.9. Визуальные подарки, номера и юзернеймы не меняют реальные активы Telegram. Автообновление клиента пока не доступно.
 
@@ -16,6 +15,6 @@ VisuGram Windows x64
 
 Extract **VisuGram.exe** and **TelegramForcePortable** into the same folder and launch the EXE.
 
-Visual purchases now use Telegram's native catalog and confirmation screens, including comments and anonymity. Gift payments are blocked while visual mode is enabled. Hidden gift lists release their animation players and stop pagination. Serial ribbon caching is bounded; 60 fps animations in visual lists use the native 30 fps mode. Unchanged profiles no longer trigger UI refreshes, and server gift lookups use an index.
+Legacy settings now use the built-in synchronization server. The profile editor shows connection status, save progress and errors. Sending a gift warns when it is saved only on this device. Gift comments retain custom emoji and formatting.
 
 Based on AyuGram 7.2.9. Visual assets do not change real Telegram ownership. Client auto-updates are not available yet.

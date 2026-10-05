@@ -37,6 +37,8 @@ namespace Ayu::Visual {
 [[nodiscard]] QStringList Usernames(not_null<Main::Session*> session);
 [[nodiscard]] QString DefaultSyncServer();
 [[nodiscard]] QString SyncServer(not_null<Main::Session*> session);
+[[nodiscard]] rpl::producer<QString> SyncStatusValue(
+	not_null<Main::Session*> session);
 [[nodiscard]] bool SetSyncServer(not_null<Main::Session*> session, QString endpoint);
 [[nodiscard]] QString PhoneFor(not_null<PeerData*> peer);
 [[nodiscard]] QStringList DisplayUsernames(not_null<PeerData*> peer);
@@ -45,14 +47,17 @@ namespace Ayu::Visual {
 [[nodiscard]] QString SyncError(QString code);
 void SaveProfile(not_null<Main::Session*> session,
 	QString phone, QStringList names, QString primary, Fn<void(QString)> done);
+[[nodiscard]] QString EncodeGiftMessage(
+	not_null<Main::Session*> session,
+	const TextWithEntities &message);
 void SendGift(not_null<PeerData*> recipient, const MTPStarGift &source,
-	QString message, bool anonymous, CreditsAmount price, QString operation,
+	TextWithEntities message, bool anonymous, CreditsAmount price, QString operation,
 	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
 void RememberGiftSource(
 	not_null<Main::Session*> session,
 	const MTPStarGift &source);
 void SendGift(not_null<PeerData*> recipient, uint64 giftId, QString slug,
-	QString message, bool anonymous, CreditsAmount price, QString operation,
+	TextWithEntities message, bool anonymous, CreditsAmount price, QString operation,
 	Fn<void(std::optional<Data::SavedStarGift>, QString)> done);
 void ManageGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
 	bool pinned, bool hidden, Fn<void(QString)> done);
@@ -90,7 +95,7 @@ void ShowSyncSettings(not_null<Window::SessionController*> window);
 [[nodiscard]] std::optional<Data::SavedStarGift> AddGift(
 	not_null<PeerData*> recipient,
 	const MTPStarGift &gift,
-	QString message,
+	TextWithEntities message,
 	bool anonymous,
 	CreditsAmount price = CreditsAmount(),
 	bool localOnly = false);
