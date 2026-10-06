@@ -59,7 +59,8 @@ module("base_plugin", AppEvent=AppEvent, BasePlugin=BasePlugin, MethodHook=objec
        HookResult=Setting, HookStrategy=HookStrategy)
 module("client_utils", EXTERNAL_NETWORK_QUEUE="external", get_last_fragment=lambda: VISIBLE,
        run_on_queue=lambda fn, queue: NETWORK.append(fn))
-module("hook_utils", find_class=lambda name: None, get_private_field=lambda obj, name: getattr(obj, name, None))
+module("hook_utils", find_class=lambda name: None, get_private_field=lambda obj, name: getattr(obj, name, None),
+       set_private_field=lambda obj, name, value: setattr(obj, name, value) or True)
 module("java.util", Locale=types.SimpleNamespace(getDefault=lambda: types.SimpleNamespace(getLanguage=lambda: "en")))
 module("org.telegram.messenger", UserConfig=UserConfig,
        MessagesController=types.SimpleNamespace(getInstance=lambda account: CONTROLLERS[account]))
@@ -267,7 +268,7 @@ class ProfileTests(unittest.TestCase):
                   and node.targets[0].id.startswith("__")}
         self.assertEqual(source.suffix, ".plugin")
         self.assertEqual(values["__sdk_version__"], ">=1.4.0")
-        self.assertEqual(values["__version__"], "0.3.2")
+        self.assertEqual(values["__version__"], "0.4.0")
 
     def test_legacy_editor_without_edittext_or_logger(self):
         self.assertIsNone(plugin.EditText)

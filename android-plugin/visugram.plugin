@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 import struct
@@ -15,7 +16,7 @@ from base_plugin import AppEvent, BasePlugin, HookResult, HookStrategy, MethodHo
 from client_utils import (
     EXTERNAL_NETWORK_QUEUE, get_last_fragment, run_on_queue,
 )
-from hook_utils import find_class, get_private_field
+from hook_utils import find_class, get_private_field, set_private_field
 from java.util import Locale
 from org.telegram.messenger import MessagesController, UserConfig
 from ui.alert import AlertDialogBuilder
@@ -31,7 +32,7 @@ __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -39,6 +40,8 @@ __sdk_version__ = ">=1.4.0"
 SERVER = "https://visugram-api-production.up.railway.app"
 POLL_MS = 30_000
 REMOTE_LIMIT = 32
+DISPLAY_LIMIT = 8
+DISPLAY_RECORDS = 120
 MAX_RESPONSE = 256 * 1024
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 PAYMENT_REQUESTS = ("TL_payments_canPurchaseStore", "TL_payments_sendStarsForm",
@@ -379,6 +382,133 @@ def find_method(class_name, name, arguments):
         clazz = clazz.getSuperclass()
     return None
 
+def gift_dialog(record, viewer):
+    if record["sender_id"] == viewer:
+        return record["recipient_id"]
+    return record["sender_id"] if record["sender_id"] != "0" else viewer
+
+def gift_comment(record):
+    from org.telegram.tgnet import TLRPC
+
+    if not record["message"]:
+        return None
+    if record.get("message_data"):
+        stream = native_stream(record["message_data"])
+        try:
+            message = TLRPC.TL_textWithEntities.TLdeserialize(stream, stream.readInt32(True), True)
+            if message is not None and str(message.text) == record["message"]:
+                return message
+        finally:
+            stream.cleanup()
+    message = TLRPC.TL_textWithEntities()
+    message.text = record["message"]
+    return message
+
+def native_peer(identifier):
+    from org.telegram.tgnet import TLRPC
+
+    peer = TLRPC.TL_peerUser()
+    peer.user_id = int(identifier)
+    return peer
+
+def clone_user_info(info):
+    from android.util import Base64
+    from org.telegram.tgnet import SerializedData, TLRPC
+
+    encoded = native_bytes(info)
+    if len(encoded) > MAX_RESPONSE:
+        raise ValueError("USER_INFO_TOO_LARGE")
+    stream = SerializedData(Base64.decode(base64.b64encode(encoded).decode("ascii"), Base64.DEFAULT))
+    try:
+        return TLRPC.UserFull.TLdeserialize(stream, stream.readInt32(True), True)
+    finally:
+        stream.cleanup()
+
+def visual_message_id(record):
+    digest = hashlib.sha256(record["id"].encode("utf-8")).digest()
+    return -0x40000000 - (int.from_bytes(digest[:4], "little") & 0x3fffffff)
+
+def native_saved_gift(record, title):
+    from org.telegram.tgnet.tl import TL_stars
+
+    gift, message = decode_gift(record["source"]), gift_comment(record)
+    if str(gift.getClass().getSimpleName()).startswith("TL_starGiftUnique"):
+        gift.owner_id, gift.owner_address, gift.gift_address = None, None, None
+        gift.owner_name = title
+        if getattr(gift, "resell_amount", None) is not None:
+            gift.resell_amount.clear()
+        for index in range(gift.attributes.size() - 1, -1, -1):
+            if "OriginalDetails" in str(gift.attributes.get(index).getClass().getSimpleName()):
+                gift.attributes.remove(index)
+        details = TL_stars.starGiftAttributeOriginalDetails()
+        details.date, details.recipient_id = record["date"], native_peer(record["recipient_id"])
+        if int(record["sender_id"]) > 0 and not record.get("anonymous"):
+            details.sender_id, details.flags = native_peer(record["sender_id"]), 1
+        if message is not None:
+            details.message, details.flags = message, details.flags | 2
+        gift.attributes.add(details)
+    saved = TL_stars.TL_savedStarGift()
+    saved.gift, saved.date, saved.msg_id, saved.flags = gift, record["date"], visual_message_id(record), 8
+    saved.name_hidden, saved.unsaved = bool(record.get("anonymous")), bool(record.get("hidden"))
+    saved.pinned_to_top = bool(record.get("pinned"))
+    if int(record["sender_id"]) > 0:
+        saved.from_id, saved.flags = native_peer(record["sender_id"]), saved.flags | 2
+    if message is not None:
+        saved.message, saved.flags = message, saved.flags | 4
+    return saved
+
+def native_gift_message(account, viewer, record, saved):
+    from org.telegram.messenger import MessageObject
+    from org.telegram.tgnet import TLRPC
+    from org.telegram.tgnet.tl import TL_stars
+
+    unique = str(saved.gift.getClass().getSimpleName()).startswith("TL_starGiftUnique")
+    action = TLRPC.TL_messageActionStarGiftUnique() if unique else TLRPC.TL_messageActionStarGift()
+    action.gift, action.saved = saved.gift, not bool(record.get("hidden"))
+    if unique:
+        amount = TL_stars.TL_starsTonAmount() if record["currency"] == "TON" else TL_stars.TL_starsAmount()
+        amount.amount, amount.nanos = int(record["price"]), 0
+        if amount.amount:
+            action.resale_amount, action.flags = amount, action.flags | 256
+        else:
+            action.transferred = True
+    else:
+        action.message, action.name_hidden = saved.message, saved.name_hidden
+        if saved.message is not None:
+            action.flags |= 2
+    message = TLRPC.TL_messageService()
+    message.id, message.local_id, message.date = saved.msg_id, saved.msg_id, record["date"]
+    message.dialog_id = int(gift_dialog(record, viewer))
+    message.out, message.unread, message.send_state = record["sender_id"] == viewer, False, 0
+    message.from_id = native_peer(record["sender_id"] if int(record["sender_id"]) > 0 else viewer)
+    message.peer_id = native_peer(record["recipient_id"])
+    message.action, message.flags = action, 256 | (2 if message.out else 0)
+    result = MessageObject(account, message, True, False)
+    result.stableId = saved.msg_id
+    if unique:
+        card = TLRPC.TL_messageActionStarGift()
+        card.gift, card.message, card.saved, card.name_hidden = saved.gift, saved.message, action.saved, saved.name_hidden
+        card.gift.sticker = saved.gift.getDocument()
+        card.gift_num = int(saved.gift.num)
+        card.to_id, card.auction_acquired = native_peer(record["recipient_id"]), message.out
+        if saved.message is not None:
+            card.flags |= 2
+        message.action = card
+        result.type, result.contentType = MessageObject.TYPE_GIFT_STARS, 1
+    if record["sender_id"] == "0":
+        result.messageText = "Anonymous gift" if str(Locale.getDefault().getLanguage()) != "ru" else "Анонимный подарок"
+    return result
+
+class GiftDisplayHook(MethodHook):
+    def __init__(self, plugin, action):
+        self.plugin, self.action = plugin, action
+
+    def before_hooked_method(self, param):
+        self.plugin._display_hook(self.action, param, True)
+
+    def after_hooked_method(self, param):
+        self.plugin._display_hook(self.action, param, False)
+
 class ProfileBindHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
@@ -577,6 +707,9 @@ class VisuGramPlugin(BasePlugin):
         self._gift_resale, self._gift_diagnostics = False, []
         self._gift_confirmation_scope = None
         self._gift_page_state, self._gift_page_busy = None, None
+        self._display_pages, self._display_lists, self._display_views = OrderedDict(), OrderedDict(), OrderedDict()
+        self._display_registry, self._display_suspended = {}, 0
+        self._display_profile, self._display_chat = False, False
 
     def on_plugin_load(self):
         self._generation = getattr(self, "_generation", 0) + 1
@@ -588,6 +721,7 @@ class VisuGramPlugin(BasePlugin):
         self._gift_confirmation_scope = None
         self._install_native()
         self._install_gifts()
+        self._install_display()
         if self.get_setting("visual_gifts", False) and (not self._payment_guard or not self._gift_native):
             self.set_setting("visual_gifts", False)
         self._restart()
@@ -595,6 +729,7 @@ class VisuGramPlugin(BasePlugin):
     def on_plugin_unload(self):
         self._loaded = False
         self._generation += 1
+        self._clear_display()
         self._remote.clear()
         self._snapshots.clear()
         self._rebind_visible()
@@ -735,6 +870,516 @@ class VisuGramPlugin(BasePlugin):
         ):
             self._gift_hook(name, class_name, name, args, GiftBalanceHook(self, intro))
 
+    def _install_display(self):
+        profile, controller = "org.telegram.ui.ProfileActivity", "org.telegram.ui.Stars.StarsController"
+        gifts, sheet = controller + "$GiftsList", "org.telegram.ui.Stars.StarGiftSheet"
+        installed = {}
+        specs = (
+            ("profile_rows", profile, "updateRowsIds", []),
+            ("profile_resume", profile, "onResume", []),
+            ("profile_list", controller, "getProfileGiftsList", ["long", "boolean"]),
+            ("profile_load", gifts, "load", []),
+            ("profile_reset", gifts, "invalidate", ["boolean"]),
+            ("profile_count", controller, "invalidateProfileGifts", ["org.telegram.tgnet.TLRPC$UserFull"]),
+            ("gift_notification", "org.telegram.messenger.NotificationCenter", "postNotificationName", ["int", "[Ljava.lang.Object;"]),
+            ("chat_resume", "org.telegram.ui.ChatActivity", "onResume", []),
+            ("chat_loaded", "org.telegram.ui.ChatActivity", "didReceivedNotification", ["int", "int", "[Ljava.lang.Object;"]),
+            ("chat_layout", "org.telegram.ui.Cells.ChatActionCell", "createGiftPremiumLayouts", [
+                "java.lang.CharSequence", "java.lang.CharSequence", "java.lang.CharSequence", "java.lang.CharSequence",
+                "boolean", "java.lang.CharSequence", "int", "java.lang.CharSequence", "int", "boolean", "boolean"]),
+            ("gift_sheet", sheet, "set", ["org.telegram.messenger.MessageObject"]),
+            ("gift_sheet", sheet, "set", ["org.telegram.messenger.MessageObject", controller + "$IGiftsList"]),
+        )
+        for action, clazz, name, arguments in specs:
+            ready = self._gift_hook(action, clazz, name, arguments, GiftDisplayHook(self, action))
+            installed[action] = installed.get(action, False) or ready
+        self._display_profile = all(installed.get(name) for name in (
+            "profile_rows", "profile_resume", "profile_list", "profile_load", "profile_reset", "profile_count", "gift_notification"))
+        self._display_chat = all(installed.get(name) for name in ("chat_resume", "chat_loaded", "gift_sheet"))
+
+    def _display_enabled(self):
+        return self._loaded and self.get_setting("sync_enabled", False) and not self._display_suspended
+
+    def _display_hook(self, action, param, before):
+        try:
+            if not self._display_enabled():
+                return
+            if action == "profile_rows" and before:
+                self._overlay_profile(param.thisObject)
+            elif action in ("profile_resume", "chat_resume") and not before:
+                self._display_visible(param.thisObject)
+            elif action == "profile_list" and not before and self._display_profile:
+                self._merge_gift_list(param.getResult())
+            elif action in ("profile_load", "profile_reset") and self._display_profile:
+                target = param.thisObject
+                if before:
+                    binding = self._list_binding(target)
+                    if binding is not None:
+                        self._restore_gift_list(binding)
+                        if action == "profile_load" and bool(target.endReached):
+                            page = self._display_pages.get(binding["key"])
+                            if page is not None and page.get("next"):
+                                self._request_display(binding["key"], True)
+                            param.setResult(None)
+                else:
+                    self._merge_gift_list(target)
+            elif action == "profile_count":
+                if before:
+                    for binding in self._display_lists.values():
+                        self._restore_gift_list(binding)
+                    self._display_suspended += 1
+            elif action == "gift_notification" and before and self._display_profile:
+                from org.telegram.messenger import NotificationCenter
+
+                args = param.args[1]
+                if int(param.args[0]) == NotificationCenter.starUserGiftsLoaded and len(args) >= 2:
+                    self._merge_gift_list(args[1])
+                    self._overlay_profile(get_last_fragment())
+            elif action == "chat_loaded" and not before and self._display_chat:
+                from org.telegram.messenger import NotificationCenter
+
+                if int(param.args[0]) == NotificationCenter.messagesDidLoad:
+                    self._display_visible(param.thisObject, more=True)
+            elif action == "gift_sheet" and before:
+                message = param.args[0]
+                account = int(get_private_field(param.thisObject, "currentAccount"))
+                entry = self._display_entry(account, int(message.getId())) if message is not None else None
+                if entry is not None:
+                    user = get_user_config(account).getCurrentUser()
+                    if user is not None and str(user.id) == entry[0][1]:
+                        param.setResult(param.thisObject)
+                        set_private_field(param.thisObject, "dialogId", 0)
+                        param.thisObject.set(entry[2], None)
+            elif action == "chat_layout" and before:
+                message = get_private_field(param.thisObject, "currentMessageObject")
+                account = int(get_private_field(param.thisObject, "currentAccount"))
+                entry = self._display_entry(account, int(message.getId())) if message is not None else None
+                if entry is not None:
+                    gift = entry[2].gift
+                    if str(gift.getClass().getSimpleName()).startswith("TL_starGiftUnique"):
+                        param.args[1] = str(gift.title) + " #" + format(int(gift.num), ",")
+                        param.args[7] = self._text("Gift", "Подарок")
+                    if entry[1]["sender_id"] == "0":
+                        param.args[0] = self._text("Anonymous gift", "Анонимный подарок")
+        except Exception as error:
+            self._gift_hook_issue(action, type(error).__name__ + ": " + str(error))
+        finally:
+            if action == "profile_count" and not before and self._display_suspended:
+                self._display_suspended -= 1
+                if self._display_enabled():
+                    for binding in list(self._display_lists.values()):
+                        target = binding["ref"].get()
+                        if target is not None:
+                            self._merge_gift_list(target)
+
+    def _display_key(self, account, direction, owner):
+        user = get_user_config(account).getCurrentUser()
+        if user is None or int(owner) <= 0:
+            return None
+        return account, str(user.id), direction, str(owner)
+
+    def _display_page(self, key):
+        if key is None or not self._display_enabled():
+            return None
+        if key not in self._display_pages:
+            self._display_pages[key] = {"records": [], "objects": {}, "count": 0, "cursor": "", "next": "", "time": 0, "busy": None}
+        self._display_pages.move_to_end(key)
+        while len(self._display_pages) > DISPLAY_LIMIT:
+            old, state = self._display_pages.popitem(last=False)
+            self._retire_display(old)
+        self._request_display(key)
+        return self._display_pages[key]
+
+    def _request_display(self, key, more=False):
+        state, generation = self._display_pages.get(key), self._generation
+        if state is None or not self._running(generation):
+            return
+        if state["busy"] == generation:
+            return
+        if more:
+            if not state["next"] or len(state["records"]) >= DISPLAY_RECORDS:
+                return
+        elif time.monotonic() - state["time"] < POLL_MS / 1000:
+            return
+        offset, cursor = (state["next"], state["cursor"]) if more else ("", "")
+        state["busy"] = generation
+        account, viewer, direction, owner = key
+        body = {"direction": direction, "offset": offset, "cursor": cursor}
+        body["peer_id" if direction == "chat" else "owner_id"] = owner
+
+        def work():
+            try:
+                page = post_json("/v1/gifts/page", viewer, body)
+                records = page.get("gifts")
+                if (not isinstance(records, list) or len(records) > 6 or type(page.get("count")) is not int
+                        or not 0 <= page["count"] < 2**31 or not isinstance(page.get("cursor"), str)
+                        or not isinstance(page.get("next_offset"), str)):
+                    raise ValueError("INVALID_GIFT_PAGE")
+                page["gifts"] = [validate_gift(record) for record in records]
+                if any((gift_dialog(record, viewer) != owner if direction == "chat" else record["recipient_id"] != owner)
+                       for record in page["gifts"]):
+                    raise ValueError("INVALID_GIFT_PAGE")
+                error = ""
+            except (OSError, ValueError, TypeError, ApiError) as failure:
+                page, error = None, getattr(failure, "code", "SERVER_UNAVAILABLE")
+            run_on_ui_thread(lambda: self._display_finish(key, state, generation, offset, page, error))
+
+        run_on_queue(work, EXTERNAL_NETWORK_QUEUE)
+
+    def _display_finish(self, key, state, generation, offset, page, error):
+        if self._display_pages.get(key) is not state or state["busy"] != generation:
+            return
+        state["busy"] = None
+        if not self._running(generation) or self._display_key(key[0], key[2], key[3]) != key:
+            return
+        state["time"] = time.monotonic()
+        if error:
+            if error == "GIFT_PAGE_CHANGED":
+                state["time"] = 0
+                self._request_display(key)
+            else:
+                self._gift_hook_issue("Gift display request", error)
+            return
+        same = page["cursor"] == state["cursor"]
+        if offset and not same:
+            state["time"] = 0
+            self._request_display(key)
+            return
+        if not offset and same and state["records"][:len(page["gifts"])] == page["gifts"]:
+            if state["count"] == page["count"]:
+                return
+            state["count"] = page["count"]
+        else:
+            records = (state["records"] if offset else []) + page["gifts"]
+            records = list({record["id"]: record for record in records}.values())[:DISPLAY_RECORDS]
+            retained = {record["id"] for record in records if record in state["records"]}
+            self._retire_display(key, views=False)
+            state["objects"] = {identifier: value for identifier, value in state["objects"].items() if identifier in retained}
+            state.update(records=records, count=page["count"], cursor=page["cursor"], next=page["next_offset"])
+            if len(records) >= DISPLAY_RECORDS:
+                state["next"] = ""
+        self._display_visible()
+        for binding in list(self._display_lists.values()):
+            target = binding["ref"].get()
+            if binding["key"] == key and target is not None:
+                self._merge_gift_list(target)
+                target.notifyUpdate()
+
+    def _saved_display(self, key, record):
+        state = self._display_pages[key]
+        if record["id"] not in state["objects"]:
+            state["objects"][record["id"]] = native_saved_gift(record, self._text("Visual gift", "Визуальный подарок"))
+        saved = state["objects"][record["id"]]
+        registry_key = key[0], int(saved.msg_id)
+        existing = self._display_registry.get(registry_key)
+        if existing is not None and existing[1]["id"] != record["id"]:
+            raise ValueError("GIFT_ID_COLLISION")
+        self._display_registry[registry_key] = key, record, saved
+        return saved
+
+    def _display_entry(self, account, message_id):
+        user = get_user_config(account).getCurrentUser()
+        if user is None:
+            return None
+        viewer = str(user.id)
+        entry = self._display_registry.get((account, message_id))
+        if entry is not None and entry[0][1] == viewer:
+            return entry
+        if message_id > -0x40000000:
+            return None
+        for key, state in self._display_pages.items():
+            if key[:2] == (account, viewer):
+                for record in state["records"]:
+                    if visual_message_id(record) == message_id:
+                        saved = self._saved_display(key, record)
+                        return key, record, saved
+        return None
+
+    def _list_binding(self, target):
+        from java.lang import System
+
+        return self._display_lists.get(int(System.identityHashCode(target)))
+
+    def _restore_gift_list(self, binding):
+        target = binding["ref"].get()
+        if target is None or not binding.get("augmented"):
+            return
+        for index in range(target.gifts.size() - 1, -1, -1):
+            if int(target.gifts.get(index).msg_id) in binding["ids"]:
+                target.gifts.remove(index)
+        target.totalCount, target.endReached = binding["count"], binding["end"]
+        binding["augmented"] = False
+
+    def _merge_gift_list(self, target):
+        from java.lang import System
+        from java.lang.ref import WeakReference
+
+        if target is None or not self._display_profile or not self._display_enabled():
+            return
+        if bool(target.isCollection) or int(get_private_field(target, "craftingGiftId") or 0):
+            return
+        key = self._display_key(int(target.currentAccount), "received", int(target.dialogId) or str(get_user_config(int(target.currentAccount)).getClientUserId()))
+        active = self._profile_context(get_last_fragment())
+        visible = active is not None and key is not None and active == (key[0], key[1], key[3])
+        page = self._display_page(key) if visible else self._display_pages.get(key)
+        if page is None or bool(target.loading):
+            return
+        identity = int(System.identityHashCode(target))
+        binding = self._display_lists.get(identity)
+        if binding is None:
+            binding = {"ref": WeakReference(target), "key": key, "ids": set(), "augmented": False}
+            self._display_lists[identity] = binding
+        if binding["key"] != key:
+            self._restore_gift_list(binding)
+            binding["key"] = key
+        self._restore_gift_list(binding)
+        binding.update(count=int(target.totalCount), end=bool(target.endReached), ids=set())
+        existing = {int(gift.msg_id) for gift in java_items(target.gifts)}
+        count = 0
+        for record in page["records"]:
+            try:
+                saved = self._saved_display(key, record)
+                unique = str(saved.gift.getClass().getSimpleName()).startswith("TL_starGiftUnique")
+                if unique and not target.isInclude_unique():
+                    continue
+                if not unique:
+                    allowed = target.isInclude_upgradable() if saved.gift.upgrade_stars > 0 else (
+                        target.isInclude_limited() if saved.gift.limited else target.isInclude_unlimited())
+                    if not allowed:
+                        continue
+                if not (target.isInclude_hidden() if saved.unsaved else target.isInclude_displayed()):
+                    continue
+                if int(saved.msg_id) in existing:
+                    continue
+                target.gifts.add(saved)
+                binding["ids"].add(int(saved.msg_id))
+                count += 1
+            except Exception as error:
+                self._gift_hook_issue("Profile gift", str(error))
+        items = java_items(target.gifts)
+        if target.sort_by_date:
+            items.sort(key=lambda gift: (not bool(gift.pinned_to_top), -int(gift.date)))
+        target.gifts.clear()
+        for gift in items:
+            target.gifts.add(gift)
+        total = count if target.hasFilters() else page["count"]
+        target.totalCount = binding["count"] + total
+        target.endReached = binding["end"] and not bool(page["next"])
+        binding["augmented"] = True
+        while len(self._display_lists) > DISPLAY_LIMIT:
+            discarded = self._display_lists.popitem(last=False)[1]
+            self._restore_gift_list(discarded)
+
+    def _overlay_profile(self, fragment):
+        from java.lang import System
+        from java.lang.ref import WeakReference
+
+        context = self._profile_context(fragment)
+        if not self._display_profile or context is None:
+            return
+        account, viewer, owner = context
+        key = account, viewer, "received", owner
+        page = self._display_page(key)
+        info = get_private_field(fragment, "userInfo")
+        if info is None or page is None:
+            return
+        identity = int(System.identityHashCode(fragment))
+        binding = self._display_views.get(identity)
+        if binding is not None and binding.get("overlay") is not None and info.equals(binding["overlay"]):
+            original = binding["original"]
+        else:
+            original = info
+        count = int(original.stargifts_count) + page["count"]
+        if binding is not None and info.equals(binding.get("overlay")) and int(info.stargifts_count) == count:
+            return
+        clone = clone_user_info(original)
+        if clone is None:
+            return
+        clone.stargifts_count = count
+        if not set_private_field(fragment, "userInfo", clone):
+            raise ValueError("PROFILE_FIELD_UNAVAILABLE")
+        self._display_views[identity] = {"ref": WeakReference(fragment), "key": key, "original": original, "overlay": clone}
+        layout = get_private_field(fragment, "sharedMediaLayout")
+        if layout is not None:
+            layout.setUserInfo(clone)
+        self._trim_display_views()
+
+    def _chat_context(self, fragment):
+        if fragment is None or str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
+            return None
+        if (int(get_private_field(fragment, "chatMode") or 0) != 0 or fragment.isThreadChat()
+                or get_private_field(fragment, "currentEncryptedChat") is not None):
+            return None
+        return self._display_key(int(fragment.getCurrentAccount()), "chat", int(fragment.getDialogId()))
+
+    def _display_visible(self, fragment=None, more=False):
+        if not self._display_enabled():
+            return
+        try:
+            fragment = fragment or get_last_fragment()
+            if self._profile_context(fragment) is not None and self._display_profile:
+                self._overlay_profile(fragment)
+                from org.telegram.ui.Stars import StarsController
+
+                StarsController.getInstance(int(fragment.getCurrentAccount())).getProfileGiftsList(int(fragment.getDialogId()))
+                self._rebind_visible()
+            elif self._display_chat:
+                key = self._chat_context(fragment)
+                if key is None:
+                    return
+                page = self._display_page(key)
+                if page is None or bool(get_private_field(fragment, "firstLoading")):
+                    return
+                self._merge_chat(fragment, key)
+                if more and page["next"] and page["records"]:
+                    dates = [int(value.messageOwner.date) for value in java_items(fragment.messages)
+                             if not value.isDateObject and int(value.getId()) > 0]
+                    if dates and min(dates) <= min(record["date"] for record in page["records"]):
+                        self._request_display(key, True)
+        except Exception as error:
+            self._gift_hook_issue("Gift display", type(error).__name__ + ": " + str(error))
+
+    def _remove_chat(self, binding):
+        fragment = binding["ref"].get()
+        if fragment is None:
+            return
+        messages = fragment.messages
+        dictionaries = get_private_field(fragment, "messagesDict")
+        days = get_private_field(fragment, "messagesByDays")
+        sorted_days = get_private_field(fragment, "messagesByDaysSorted")
+        for value in binding.get("messages", []):
+            messages.remove(value)
+            if dictionaries is not None and dictionaries[0].get(int(value.getId())) == value:
+                dictionaries[0].remove(int(value.getId()))
+            group = days.get(value.dateKey) if days is not None else None
+            if group is not None:
+                group.remove(value)
+                if group.isEmpty():
+                    days.remove(value.dateKey)
+                    sorted_days.remove(int(value.dateKeyInt))
+        for header in binding.get("headers", []):
+            group = days.get(header.dateKey) if days is not None else None
+            if group is None or group.isEmpty():
+                messages.remove(header)
+        binding["messages"], binding["headers"] = [], []
+
+    def _merge_chat(self, fragment, key):
+        from java.lang import System
+        from java.lang.ref import WeakReference
+        from java.util import ArrayList, Calendar
+        from org.telegram.messenger import LocaleController, MessageObject
+        from org.telegram.tgnet import TLRPC
+
+        identity = int(System.identityHashCode(fragment))
+        binding = self._display_views.get(identity)
+        if binding is None:
+            binding = {"ref": WeakReference(fragment), "key": key, "messages": [], "headers": []}
+            self._display_views[identity] = binding
+        page, messages = self._display_pages[key], fragment.messages
+        dictionaries = get_private_field(fragment, "messagesDict")
+        days = get_private_field(fragment, "messagesByDays")
+        sorted_days = get_private_field(fragment, "messagesByDaysSorted")
+        adapter = get_private_field(fragment, "chatAdapter")
+        if any(value is None for value in (dictionaries, days, sorted_days, adapter)):
+            return
+        actual = [int(value.messageOwner.date) for value in java_items(messages) if not value.isDateObject and int(value.getId()) > 0]
+        oldest = min(actual) if actual else 0
+        signature = key, page["cursor"], oldest, tuple(record["id"] for record in page["records"])
+        if binding.get("signature") == signature and all(messages.contains(value) for value in binding.get("messages", [])):
+            return
+        self._remove_chat(binding)
+        binding["key"], binding["signature"] = key, signature
+        for record in sorted(page["records"], key=lambda item: item["date"], reverse=True):
+            if record["date"] < oldest and actual:
+                continue
+            try:
+                saved = self._saved_display(key, record)
+                if dictionaries[0].get(int(saved.msg_id)) is not None:
+                    continue
+                value = native_gift_message(key[0], key[1], record, saved)
+                items = java_items(messages)
+                position = next((index for index, current in enumerate(items)
+                                 if int(current.messageOwner.date) <= record["date"]), len(items))
+                messages.add(position, value)
+                dictionaries[0].put(int(value.getId()), value)
+                group = days.get(value.dateKey)
+                if group is None:
+                    group = ArrayList()
+                    days.put(value.dateKey, group)
+                    sorted_days.put(int(value.dateKeyInt), group)
+                    date = TLRPC.TL_message()
+                    calendar = Calendar.getInstance()
+                    calendar.setTimeInMillis(record["date"] * 1000)
+                    for field in (Calendar.HOUR_OF_DAY, Calendar.MINUTE, Calendar.SECOND, Calendar.MILLISECOND):
+                        calendar.set(field, 0)
+                    date.id, date.date = 0, int(calendar.getTimeInMillis() // 1000)
+                    date.message = LocaleController.formatDateChat(record["date"])
+                    header = MessageObject(key[0], date, False, False)
+                    header.type, header.contentType, header.isDateObject = MessageObject.TYPE_DATE, 1, True
+                    header.stableId = -int(value.dateKeyInt) - 0x10000000
+                    messages.add(position + 1, header)
+                    binding["headers"].append(header)
+                group.add(value)
+                binding["messages"].append(value)
+            except Exception as error:
+                self._gift_hook_issue("Chat gift", type(error).__name__ + ": " + str(error))
+        adapter.updateRowsSafe()
+        adapter.notifyDataSetChanged()
+        self._trim_display_views()
+
+    def _trim_display_views(self):
+        while len(self._display_views) > DISPLAY_LIMIT:
+            binding = self._display_views.popitem(last=False)[1]
+            self._restore_display_view(binding)
+
+    def _restore_display_view(self, binding):
+        fragment = binding["ref"].get()
+        if fragment is None:
+            return
+        if "overlay" in binding:
+            info = get_private_field(fragment, "userInfo")
+            if info is not None and info.equals(binding["overlay"]):
+                set_private_field(fragment, "userInfo", binding["original"])
+                layout = get_private_field(fragment, "sharedMediaLayout")
+                if layout is not None:
+                    layout.setUserInfo(binding["original"])
+        else:
+            self._remove_chat(binding)
+            adapter = get_private_field(fragment, "chatAdapter")
+            if adapter is not None:
+                adapter.updateRowsSafe()
+                adapter.notifyDataSetChanged()
+
+    def _retire_display(self, key, views=True):
+        for identity, binding in list(self._display_lists.items()):
+            if binding["key"] == key:
+                self._restore_gift_list(binding)
+                if views:
+                    del self._display_lists[identity]
+        if views:
+            for identity, binding in list(self._display_views.items()):
+                if binding["key"] == key:
+                    self._restore_display_view(binding)
+                    del self._display_views[identity]
+        self._display_registry = {identifier: entry for identifier, entry in self._display_registry.items() if entry[0] != key}
+
+    def _clear_display(self):
+        for key in list(self._display_pages):
+            try:
+                self._retire_display(key)
+            except Exception as error:
+                self._gift_hook_issue("Gift cleanup", str(error))
+        self._display_pages.clear()
+        self._display_lists.clear()
+        self._display_views.clear()
+        self._display_registry.clear()
+
+    def _refresh_display(self, account, viewer):
+        for key, state in self._display_pages.items():
+            if key[:2] == (account, viewer):
+                state["time"] = 0
+        self._display_visible()
+
     def _gift_report(self):
         lines = ["VisuGram " + __version__]
         try:
@@ -751,7 +1396,9 @@ class VisuGramPlugin(BasePlugin):
             pass
         for title, ready in ((self._text("Payment protection", "Защита платежей"), self._payment_guard),
                              (self._text("Ordinary gifts", "Обычные подарки"), self._gift_native),
-                             (self._text("Collectibles", "Коллекционные"), self._gift_resale and self._gift_native)):
+                             (self._text("Collectibles", "Коллекционные"), self._gift_resale and self._gift_native),
+                             (self._text("Profile gift grid", "Сетка подарков профиля"), self._display_profile),
+                             (self._text("Chat gift cards", "Карточки подарков в чате"), self._display_chat)):
             status = self._text("ready", "готово") if ready else self._text("unavailable", "недоступно")
             lines.append(title + ": " + status)
         lines.extend(self._gift_diagnostics[:12])
@@ -856,6 +1503,7 @@ class VisuGramPlugin(BasePlugin):
             self._snapshots[user_id] = cached
         self._gift_callback(callback, True)
         self._refresh(generation)
+        self._refresh_display(account, user_id)
         try:
             from org.telegram.ui import LaunchActivity
 
@@ -1023,6 +1671,7 @@ class VisuGramPlugin(BasePlugin):
                     self._show_error(error)
                     return
                 self.set_setting("gift_manage:" + user_id, {})
+                self._refresh_display(account, user_id)
                 self._load_gift_page()
                 BulletinHelper.show_info(self._text("Gift updated.", "Подарок обновлён."))
 
@@ -1124,6 +1773,7 @@ class VisuGramPlugin(BasePlugin):
         self.set_setting("sync_enabled", enabled)
         if not enabled:
             self._remote.clear()
+            self._clear_display()
         self._restart()
         self._rebind_visible()
 
@@ -1137,6 +1787,7 @@ class VisuGramPlugin(BasePlugin):
                 self._profile_for(fragment)
         except Exception:
             self._native_error()
+        self._display_visible()
         run_on_ui_thread(lambda: self._tick(generation), POLL_MS)
 
     def _cache(self, user_id):
@@ -1198,6 +1849,8 @@ class VisuGramPlugin(BasePlugin):
         if snapshot is not None:
             previous_cursor = self._cache(user_id).get("cursor")
             self._store(user_id, snapshot)
+            if previous_cursor != snapshot["cursor"]:
+                self._refresh_display(account, user_id)
             if (self._gift_page_state is not None and self._gift_page_state["user_id"] == user_id
                     and previous_cursor != snapshot["cursor"]):
                 self._gift_page_state = None
