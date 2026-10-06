@@ -32,7 +32,7 @@ __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -155,7 +155,7 @@ def decode_gift(encoded):
     stream = native_stream(encoded)
     try:
         gift = TL_stars.StarGift.TLdeserialize(stream, stream.readInt32(True), True)
-        if stream.getPosition() == len(base64.b64decode(encoded, validate=True)):
+        if stream.remaining() == 0:
             return checked_native_gift(gift)
     except Exception:
         pass
@@ -278,7 +278,7 @@ def decode_gift(encoded):
                 gift.craft_chance_permille = stream.readInt32(True)
         else:
             raise ApiError("UNSUPPORTED_GIFT")
-        if stream.getPosition() != len(base64.b64decode(encoded, validate=True)):
+        if stream.remaining() != 0:
             raise ApiError("UNSUPPORTED_GIFT")
         return checked_native_gift(gift)
     finally:
@@ -475,7 +475,7 @@ def gift_comment(record, issue=None):
             raw = canonical_message_data(record["message_data"], record["message"])
             stream = native_stream(base64.b64encode(raw).decode("ascii"))
             message = TLRPC.TL_textWithEntities.TLdeserialize(stream, stream.readInt32(True), True)
-            if message is not None and str(message.text) == record["message"] and stream.getPosition() == len(raw):
+            if message is not None and str(message.text) == record["message"] and stream.remaining() == 0:
                 length = len(record["message"].encode("utf-16-le")) // 2
                 if any(int(entity.offset) < 0 or int(entity.length) < 0 or int(entity.offset) + int(entity.length) > length
                        for entity in java_items(message.entities)):
@@ -1885,7 +1885,8 @@ class VisuGramPlugin(BasePlugin):
             sheet = StarGiftSheet(fragment.getParentActivity(), account, 0, fragment.getResourceProvider())
             sheet.set(saved, None)
             sheet.show()
-        except Exception:
+        except Exception as error:
+            self._gift_hook_issue("Gift preview", type(error).__name__ + ": " + str(error))
             self._show_error("UNSUPPORTED_GIFT")
 
     def _gift_settings(self):

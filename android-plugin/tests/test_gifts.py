@@ -201,19 +201,24 @@ class GiftTests(unittest.TestCase):
 
 class Stream:
     def __init__(self, data):
-        self.data, self.offset, self.closed = data, 0, False
+        self.data, self.offset, self.closed, self.reported_position = data, 0, False, 0
 
     def readInt32(self, exception):
         value, = struct.unpack_from("<i", self.data, self.offset)
         self.offset += 4
+        self.reported_position += 4
         return value
 
     def getPosition(self):
-        return self.offset
+        return self.reported_position
+
+    def remaining(self):
+        return len(self.data) - self.offset
 
     def readInt64(self, exception):
         value, = struct.unpack_from("<q", self.data, self.offset)
         self.offset += 8
+        self.reported_position += 8
         return value
 
     def readString(self, exception):
@@ -225,6 +230,7 @@ class Stream:
             prefix = 4
         end = start + prefix + length
         self.offset = end + (-(prefix + length)) % 4
+        self.reported_position += prefix + 1 + (-(prefix + length)) % 4
         return self.data[start + prefix:end].decode("utf-8")
 
     def cleanup(self):
@@ -293,6 +299,61 @@ class GiftCodecTests(unittest.TestCase):
         self.assertEqual(decoded.availability_total, 1000)
         self.assertEqual(decoded.last_sale_date, 200)
         self.assertTrue(all(stream.closed for stream in self.streams))
+
+    def test_android_string_position_does_not_reject_complete_native_gift(self):
+        source = plugin.gift_source(ordinary(), serialize)
+        gift = named("TL_starGift", getDocument=lambda: object())
+
+        def read_native(stream, constructor, strict):
+            self.assertEqual(constructor & 0xffffffff, 0x313a9547)
+            stream.readInt32(True)
+            stream.readInt64(True)
+            self.rpc.Document.TLdeserialize(stream, stream.readInt32(True), True)
+            stream.readInt64(True)
+            stream.readInt64(True)
+            gift.title = stream.readString(True)
+            return gift
+
+        self.stars.StarGift.TLdeserialize = read_native
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            decoded = plugin.decode_gift(source)
+        self.assertIs(decoded, gift)
+        self.assertEqual(gift.title, "Rose")
+        self.assertEqual(self.streams[0].remaining(), 0)
+        self.assertNotEqual(self.streams[0].getPosition(), len(base64.b64decode(source)))
+
+    def test_complete_native_gift_with_trailing_data_is_still_rejected(self):
+        source = plugin.gift_source(ordinary(), serialize)
+        source = base64.b64encode(base64.b64decode(source) + b"\x00" * 4).decode("ascii")
+
+        def read_native(stream, constructor, strict):
+            stream.readInt32(True)
+            stream.readInt64(True)
+            self.rpc.Document.TLdeserialize(stream, stream.readInt32(True), True)
+            stream.readInt64(True)
+            stream.readInt64(True)
+            stream.readString(True)
+            return named("TL_starGift", getDocument=lambda: object())
+
+        self.stars.StarGift.TLdeserialize = read_native
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            with self.assertRaises(plugin.ApiError):
+                plugin.decode_gift(source)
+
+    def test_collectible_reaches_shared_profile_preview_with_android_stream(self):
+        self.rpc.TL_peerUser = types.SimpleNamespace
+        self.stars.starGiftAttributeOriginalDetails = lambda: named("starGiftAttributeOriginalDetails", flags=0)
+        subject = plugin.VisuGramPlugin()
+        key = 0, "101", "received", "202"
+        subject._display_pages[key] = {"objects": {}}
+        value = record(source=self.collectible(), message="", message_data="")
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            saved = subject._saved_display(key, value)
+        self.assertEqual(saved.gift.slug, "PlushPepe-7")
+        self.assertEqual(saved.gift.attributes[1].name, "Black")
+        self.assertIsNone(saved.gift.resell_amount)
+        self.assertEqual(self.streams[-1].remaining(), 0)
+        self.assertNotEqual(self.streams[-1].getPosition(), len(base64.b64decode(value["source"])))
 
     def test_old_android_decodes_model_symbol_background_and_rarity(self):
         attributes = [
@@ -462,6 +523,15 @@ class CommentCodecTests(unittest.TestCase):
         self.assertEqual(value.entities, [])
         self.assertEqual(self.issues, [])
         self.assertTrue(all(stream.closed for stream in self.streams))
+
+    def test_android_position_counter_does_not_strip_custom_emoji(self):
+        text = "подарок 👑"
+        body = plugin.tl_string(text) + struct.pack("<IIIiiq", 0x1cb5c415, 1, 0xc8cf05f8, 8, 2, 99999999999999999)
+        data = plugin.tl_int(0x751f3146) + body
+        message = self.comment(data, text)
+        self.assertEqual(message.entities[0].document_id, 99999999999999999)
+        self.assertNotEqual(self.streams[-1].getPosition(), len(data))
+        self.assertEqual(self.streams[-1].remaining(), 0)
 
     def test_bare_and_boxed_custom_emoji_keep_large_ids_and_utf16_offsets(self):
         body = plugin.tl_string("A🎉❤️") + struct.pack("<II", 0x1cb5c415, 2)
