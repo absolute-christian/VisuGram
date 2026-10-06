@@ -8,6 +8,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict
 from decimal import Decimal
+from threading import get_ident
 
 from android_utils import run_on_ui_thread
 from base_plugin import AppEvent, BasePlugin, HookResult, HookStrategy, MethodHook
@@ -30,7 +31,7 @@ __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -40,7 +41,7 @@ POLL_MS = 30_000
 REMOTE_LIMIT = 32
 MAX_RESPONSE = 256 * 1024
 NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
-PAYMENT_REQUESTS = ("TL_payments_getPaymentForm", "TL_payments_canPurchaseStore", "TL_payments_sendStarsForm",
+PAYMENT_REQUESTS = ("TL_payments_canPurchaseStore", "TL_payments_sendStarsForm",
                     "TL_payments_sendPaymentForm", "TL_payments_sendStarsFormV2")
 GIFT_MUTATIONS = tuple("TL_payments_" + name for name in (
     "saveStarGift", "convertStarGift", "transferStarGift", "updateStarGiftPrice", "upgradeStarGift",
@@ -514,6 +515,55 @@ class GiftBalanceHook(MethodHook):
         except Exception:
             pass
 
+class GiftConfirmationBalanceHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        if not self.plugin._visual_enabled():
+            return
+        try:
+            account = int(get_private_field(param.thisObject, "currentAccount"))
+            if self.plugin._gift_confirmation_scope != (account, get_ident()):
+                return
+            balance = param.getResult()
+            if balance is None:
+                return
+            clazz = balance.getClass()
+            virtual = clazz.newInstance()
+            virtual.amount = 8_000_000_000_000_000_000 if str(clazz.getSimpleName()) == "TL_starsTonAmount" else 8_000_000_000
+            virtual.nanos = 0
+            param.setResult(virtual)
+        except Exception as error:
+            self.plugin._gift_hook_issue("Gift confirmation balance", type(error).__name__ + ": " + str(error))
+
+class GiftConfirmationHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            from android_utils import OnClickListener
+
+            button = get_private_field(param.thisObject, "positiveButton")
+            listener = get_private_field(get_private_field(button, "mListenerInfo"), "mOnClickListener")
+            account = int(get_private_field(param.thisObject, "currentAccount"))
+            if listener is None:
+                raise ValueError("CONFIRMATION_LISTENER_UNAVAILABLE")
+
+            def clicked(view):
+                previous = self.plugin._gift_confirmation_scope
+                try:
+                    if self.plugin._visual_enabled():
+                        self.plugin._gift_confirmation_scope = (account, get_ident())
+                    listener.onClick(view)
+                finally:
+                    self.plugin._gift_confirmation_scope = previous
+
+            button.setOnClickListener(OnClickListener(clicked))
+        except Exception as error:
+            self.plugin._gift_hook_issue("Gift confirmation button", type(error).__name__ + ": " + str(error))
+
 class VisuGramPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
@@ -525,6 +575,7 @@ class VisuGramPlugin(BasePlugin):
         self._span_fragments = None
         self._gift_native, self._gift_busy, self._payment_guard = False, {}, False
         self._gift_resale, self._gift_diagnostics = False, []
+        self._gift_confirmation_scope = None
         self._gift_page_state, self._gift_page_busy = None, None
 
     def on_plugin_load(self):
@@ -534,6 +585,7 @@ class VisuGramPlugin(BasePlugin):
         self._remote, self._remote_busy = OrderedDict(), {}
         self._native, self._warned = False, False
         self._gift_page_busy = None
+        self._gift_confirmation_scope = None
         self._install_native()
         self._install_gifts()
         if self.get_setting("visual_gifts", False) and (not self._payment_guard or not self._gift_native):
@@ -549,6 +601,7 @@ class VisuGramPlugin(BasePlugin):
         if self._span_fragments is not None:
             self._span_fragments.clear()
         self._gift_page_state = None
+        self._gift_confirmation_scope = None
 
     def on_app_event(self, event_type):
         if not getattr(self, "_loaded", False):
@@ -672,6 +725,10 @@ class VisuGramPlugin(BasePlugin):
                                     controller, "buyResellingGift", resale_base + suffix, GiftBuyHook(self, True))
             self._gift_resale = self._gift_resale or ready
         self._gift_native = buy and premium
+        balance = self._gift_hook("StarsController.getBalance", controller, "getBalance", [], GiftConfirmationBalanceHook(self))
+        confirmation = self._gift_hook("ResaleBuyTransferAlert.show",
+            "org.telegram.ui.Stars.StarGiftSheet$ResaleBuyTransferAlert", "show", [], GiftConfirmationHook(self))
+        self._gift_resale = self._gift_resale and balance and confirmation
         for class_name, name, args, intro in (
             ("org.telegram.ui.Stars.StarsIntroActivity", "updateBalance", [], True),
             (sheet, "setButtonText", ["boolean"], False),

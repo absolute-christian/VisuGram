@@ -38,12 +38,13 @@ class Class:
         return self.parent
 
 def client_classes(premium=True, buy=True):
-    methods = [Method("buyResellingGift", [FORM, GIFT, "long", CALLBACK])]
+    methods = [Method("buyResellingGift", [FORM, GIFT, "long", CALLBACK]), Method("getBalance")]
     if buy:
         methods.append(Method("buyStarGift", [GIFT, "boolean", "boolean", "long", TEXT, CALLBACK]))
     return {CONTROLLER: Class(methods), SHEET: Class(
         [Method("buyPremiumTier")] if premium else [], Class([Method("show")])),
-        "org.telegram.ui.Stars.StarsIntroActivity": Class([Method("updateBalance")])}
+        "org.telegram.ui.Stars.StarsIntroActivity": Class([Method("updateBalance")]),
+        "org.telegram.ui.Stars.StarGiftSheet$ResaleBuyTransferAlert": Class([Method("show")])}
 
 class GiftHookTests(unittest.TestCase):
     def setUp(self):
@@ -177,10 +178,11 @@ class GiftHookTests(unittest.TestCase):
     def test_layered_payment_requests_and_real_gift_mutations_are_blocked(self):
         self.subject.settings["visual_gifts"] = True
         with patch.object(plugin, "run_on_ui_thread"):
-            for name in ("TL_payments_getPaymentForm", "TL_payments_canPurchaseStore", "TL_payments_saveStarGift",
+            for name in ("TL_payments_canPurchaseStore", "TL_payments_saveStarGift",
                          "TL_payments_sendStarsForm_layer222", "TL_payments_transferStarGift"):
                 self.assertEqual(self.subject.pre_request_hook(name, 0, object()).strategy, "cancel")
             self.assertFalse(hasattr(self.subject.pre_request_hook("TL_payments_getStarGifts", 0, object()), "strategy"))
+            self.assertFalse(hasattr(self.subject.pre_request_hook("TL_payments_getPaymentForm", 0, object()), "strategy"))
             self.subject.settings["visual_gifts"] = False
             self.assertFalse(hasattr(self.subject.pre_request_hook("TL_payments_sendStarsForm", 0, object()), "strategy"))
 
