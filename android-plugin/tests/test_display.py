@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from test_profile import plugin, USERS, UI, NETWORK, drain_ui
+from test_profile import plugin, USERS, UI, NETWORK, DELAYED, CONTROLLERS, drain_ui
 
 class List:
     def __init__(self, values=()):
@@ -126,6 +126,7 @@ class DisplayTests(unittest.TestCase):
         USERS[0] = types.SimpleNamespace(id=101, username="real")
         UI.clear()
         NETWORK.clear()
+        DELAYED.clear()
         self.subject = plugin.VisuGramPlugin()
         self.subject._loaded, self.subject._foreground = True, True
         self.subject.settings["sync_enabled"] = True
@@ -161,6 +162,7 @@ class DisplayTests(unittest.TestCase):
         self.modules.stop()
         UI.clear()
         NETWORK.clear()
+        DELAYED.clear()
 
     def chat(self, real=(), dialog=202):
         fragment = DTO(messages=List(real), messagesDict=[Map({value.getId(): value for value in real})],
@@ -191,7 +193,8 @@ class DisplayTests(unittest.TestCase):
         self.assertIs(gift.attributes.get(1).message, rich)
         self.assertEqual(gift.attributes.get(1).sender_id.user_id, 202)
         self.assertEqual(gift.attributes.get(1).recipient_id.user_id, 101)
-        self.assertEqual(gift.resell_amount.size(), 0)
+        self.assertIsNone(gift.resell_amount)
+        self.assertFalse(gift.resale_ton_only)
         self.assertIsNone(gift.owner_id)
         self.assertTrue(saved.pinned_to_top and saved.unsaved)
 
@@ -316,6 +319,94 @@ class DisplayTests(unittest.TestCase):
         self.subject._display_hook("profile_count", p, False)
         self.assertEqual(self.subject._display_suspended, 0)
         self.assertEqual(overlay.stargifts_count, 52)
+
+    def test_native_notification_defers_and_coalesces_profile_redraws(self):
+        target, fragment = gift_list(), DTO()
+        p = param(None, 17, [101, target])
+        with patch.object(plugin, "get_last_fragment", return_value=fragment), \
+             patch.object(self.subject, "_merge_gift_list"), patch.object(self.subject, "_display_visible") as refresh:
+            self.subject._display_hook("gift_notification", p, True)
+            self.subject._display_hook("gift_notification", p, True)
+            refresh.assert_not_called()
+            self.subject._queue_display(fragment, more=True)
+            refresh.assert_not_called()
+            self.assertEqual(len(DELAYED), 1)
+            DELAYED.pop(0)()
+            refresh.assert_called_once_with(fragment, True)
+
+    def test_queued_profile_redraw_does_not_run_after_disable_or_reload(self):
+        fragment = DTO()
+        for disabled in (False, True):
+            self.subject.settings["sync_enabled"] = True
+            self.subject._queue_display(fragment)
+            if disabled:
+                self.subject.settings["sync_enabled"] = False
+            else:
+                self.subject._generation += 1
+            with patch.object(self.subject, "_display_visible") as refresh:
+                DELAYED.pop(0)()
+                refresh.assert_not_called()
+        self.assertEqual(self.subject._display_pending, {})
+
+    def test_profile_overlay_does_not_reenter_native_tabs_while_rows_are_built(self):
+        calls = []
+        layout = DTO(userInfo=None, setUserInfo=lambda info: calls.append(info))
+        fragment = DTO(userInfo=DTO(stargifts_count=0), sharedMediaLayout=layout)
+        self.subject._display_pages[self.key] = state([record()])
+        with patch.object(self.subject, "_profile_context", return_value=(0, "101", "101")), \
+             patch.object(plugin, "clone_user_info", side_effect=lambda value: DTO(stargifts_count=value.stargifts_count)):
+            self.subject._display_hook("profile_rows", param(fragment), True)
+        self.assertEqual(calls, [])
+        self.subject._apply_profile_layout(fragment)
+        self.assertEqual(calls, [fragment.userInfo])
+
+    def test_profile_redraw_waits_until_recycler_finishes_layout(self):
+        fragment = DTO(listView=DTO(isComputingLayout=lambda: True))
+        with patch.object(self.subject, "_overlay_profile") as overlay:
+            self.subject._display_visible(fragment)
+            overlay.assert_not_called()
+        self.assertEqual(len(DELAYED), 1)
+        self.assertFalse(self.subject._display_rendering)
+
+    def test_nested_native_profile_refresh_does_not_schedule_recursive_work(self):
+        self.subject._display_rendering = True
+        self.subject._display_hook("profile_rows", param(DTO()), False)
+        self.assertEqual(DELAYED, [])
+
+    def test_avatar_click_uses_visual_record_and_other_gifts_keep_native_link(self):
+        self.subject._display_pages[self.key] = state([record(slug="PlushPepe-33")])
+        view = DTO(currentAccount=0, dialogId=101)
+        for slug, intercepted in (("PlushPepe-33", True), ("OtherGift-1", False)):
+            p = param(view, DTO(slug=slug))
+            with patch.object(self.subject, "_open_gift") as preview:
+                self.subject._display_hook("avatar_gift", p, True)
+            self.assertEqual(bool(p.results), intercepted)
+            self.assertEqual(preview.called, intercepted)
+        self.subject._display_pages[self.key]["records"][0]["active"] = False
+        p = param(view, DTO(slug="PlushPepe-33"))
+        self.subject._display_hook("avatar_gift", p, True)
+        self.assertEqual(p.results, [])
+
+    def test_displayed_owner_comes_from_visual_recipient(self):
+        CONTROLLERS[0] = DTO(getUser=lambda user_id: DTO(first_name="Visual", last_name="Recipient", username="new"))
+        try:
+            self.subject._display_pages[self.key] = state([record()])
+            saved = self.subject._saved_display(self.key, record())
+            self.assertEqual(saved.gift.owner_name, "Visual Recipient")
+            self.assertIsNone(saved.gift.owner_id)
+            self.assertIsNone(saved.gift.resell_amount)
+        finally:
+            CONTROLLERS.clear()
+
+    def test_host_and_sale_flags_are_removed_from_visual_gift_copy(self):
+        gift = dto("TL_starGiftUnique")(host_id=DTO(user_id=900), owner_address="real-wallet",
+                                         resale_ton_only=True, flags=1 | 4 | 8 | 16 | 128 | 4096)
+        with patch.object(plugin, "decode_gift", return_value=gift):
+            saved = plugin.native_saved_gift(record(), "Visual Recipient")
+        self.assertIsNone(saved.gift.host_id)
+        self.assertIsNone(saved.gift.owner_address)
+        self.assertIsNone(saved.gift.resell_amount)
+        self.assertEqual(saved.gift.flags, 2)
 
     def test_chat_reopens_without_duplicates_and_keeps_real_messages(self):
         real = Message(0, DTO(id=9, date=1700000400))

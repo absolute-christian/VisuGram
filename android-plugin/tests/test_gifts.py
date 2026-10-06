@@ -264,8 +264,9 @@ class GiftCodecTests(unittest.TestCase):
         self.stars = types.SimpleNamespace(
             StarGift=types.SimpleNamespace(TLdeserialize=lambda stream, constructor, exception: None),
             TL_starGift=OldGift, TL_starGiftUnique=OldGift,
-            starGiftAttributeModel=types.SimpleNamespace, starGiftAttributePattern=types.SimpleNamespace,
-            starGiftAttributeBackdrop=types.SimpleNamespace,
+            starGiftAttributeModel=lambda: named("starGiftAttributeModel"),
+            starGiftAttributePattern=lambda: named("starGiftAttributePattern"),
+            starGiftAttributeBackdrop=lambda: named("starGiftAttributeBackdrop"),
             TL_savedStarGift=types.SimpleNamespace,
         )
         self.rpc = types.SimpleNamespace(Document=types.SimpleNamespace(TLdeserialize=read_document))
@@ -311,6 +312,57 @@ class GiftCodecTests(unittest.TestCase):
         self.assertEqual(decoded.attributes[2].pattern_color, 4)
         self.assertEqual(decoded.availability_total, 1000)
 
+    def collectible(self, backdrop=True):
+        attributes = [named("starGiftAttributeModel", name="Void", document=object(), rarity_permille=15)]
+        if backdrop:
+            attributes.append(named("starGiftAttributeBackdrop", name="Black", backdrop_id=1,
+                                    center_color=2, edge_color=3, pattern_color=4, text_color=5, rarity_permille=20))
+        gift = named("TL_starGiftUnique", id=1, title="Pepe", slug="PlushPepe-7", num=7,
+                     attributes=values(attributes), availability_issued=100, availability_total=1000)
+        return plugin.gift_source(gift, serialize)
+
+    def test_partial_native_decode_does_not_reach_avatar_constructor(self):
+        partial = named("TL_starGiftUnique", getDocument=lambda: object(), attributes=JavaList())
+        native_calls = []
+
+        def incomplete(stream, constructor, strict):
+            native_calls.append(strict)
+            stream.readInt32(True)
+            return partial
+
+        self.stars.StarGift.TLdeserialize = incomplete
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            decoded = plugin.decode_gift(self.collectible())
+        self.assertIsNot(decoded, partial)
+        self.assertEqual(decoded.attributes[1].name, "Black")
+        self.assertEqual(native_calls, [True])
+        self.assertTrue(all(stream.closed for stream in self.streams))
+
+    def test_collectible_without_backdrop_is_rejected_before_native_rendering(self):
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            with self.assertRaises(plugin.ApiError):
+                plugin.decode_gift(self.collectible(backdrop=False))
+
+    def test_desktop_resale_tail_is_consumed_without_leaving_partial_gift(self):
+        source = bytearray(base64.b64decode(self.collectible()))
+        struct.pack_into("<I", source, 4, 8 | 16 | 256)
+        source += plugin.tl_string("old-wallet") + struct.pack("<II", 0x1cb5c415, 1)
+        source += struct.pack("<Iqi", 0xbbb6b4a3, 500, 0)
+        source += struct.pack("<q", 123) + plugin.tl_string("USD") + struct.pack("<q", 456)
+        self.stars.StarsAmount = types.SimpleNamespace(TLdeserialize=lambda stream, constructor, strict:
+            types.SimpleNamespace(amount=stream.readInt64(True), nanos=stream.readInt32(True)))
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            decoded = plugin.decode_gift(base64.b64encode(source).decode("ascii"))
+        self.assertEqual(decoded.gift_address, "old-wallet")
+        self.assertEqual(decoded.value_currency, "USD")
+        self.assertEqual(self.streams[-1].offset, len(source))
+
+    def test_trailing_gift_data_is_not_silently_accepted(self):
+        encoded = base64.b64encode(base64.b64decode(self.collectible()) + b"\x00" * 4).decode("ascii")
+        with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream):
+            with self.assertRaises(plugin.ApiError):
+                plugin.decode_gift(encoded)
+
     def test_preview_keeps_custom_emoji_and_uses_nonpayment_reference(self):
         subject = plugin.VisuGramPlugin()
         subject._loaded = subject._foreground = True
@@ -342,7 +394,8 @@ class GiftCodecTests(unittest.TestCase):
         self.rpc.TL_peerUser = types.SimpleNamespace
         self.rpc.TL_textWithEntities = types.SimpleNamespace(TLdeserialize=read_message)
         self.modules["org.telegram.ui.Stars"] = fake_module("org.telegram.ui.Stars", StarGiftSheet=Sheet)
-        fragment = types.SimpleNamespace(getParentActivity=lambda: object(), getResourceProvider=lambda: None)
+        fragment = types.SimpleNamespace(getParentActivity=lambda: object(), getResourceProvider=lambda: None,
+                                         getCurrentAccount=lambda: 0)
         source = plugin.gift_source(ordinary(), serialize)
         value = record(source=source, message="👑 hi", message_data=base64.b64encode(message).decode("ascii"))
         with patch.dict(sys.modules, self.modules), patch.object(plugin, "native_stream", self.stream), \
@@ -351,7 +404,7 @@ class GiftCodecTests(unittest.TestCase):
         self.assertEqual(len(captures), 1)
         arguments, saved = captures[0]
         self.assertEqual(arguments[2], 0)
-        self.assertEqual(saved.msg_id, -1)
+        self.assertEqual(saved.msg_id, plugin.visual_message_id(value))
         self.assertEqual(saved.message.text, "👑 hi")
         self.assertEqual(saved.message.entities[0].document_id, 5368324170671202286)
         self.assertEqual(saved.message.entities[0].length, 2)
