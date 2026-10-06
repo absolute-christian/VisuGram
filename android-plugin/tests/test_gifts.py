@@ -208,6 +208,9 @@ class Stream:
         self.offset += 4
         return value
 
+    def getPosition(self):
+        return self.offset
+
     def readInt64(self, exception):
         value, = struct.unpack_from("<q", self.data, self.offset)
         self.offset += 8
@@ -352,6 +355,102 @@ class GiftCodecTests(unittest.TestCase):
         self.assertEqual(saved.message.text, "👑 hi")
         self.assertEqual(saved.message.entities[0].document_id, 5368324170671202286)
         self.assertEqual(saved.message.entities[0].length, 2)
+
+class CommentCodecTests(unittest.TestCase):
+    def setUp(self):
+        self.streams, self.issues = [], []
+
+        class Text:
+            def __init__(self):
+                self.text, self.entities = "", JavaList()
+
+            @staticmethod
+            def TLdeserialize(stream, constructor, exception):
+                if constructor & 0xffffffff != 0x751f3146:
+                    raise ValueError("unsupported text constructor")
+                value = Text()
+                value.text = stream.readString(True)
+                if stream.readInt32(True) & 0xffffffff != 0x1cb5c415:
+                    raise ValueError("invalid vector")
+                for _ in range(stream.readInt32(True)):
+                    if stream.readInt32(True) & 0xffffffff != 0xc8cf05f8:
+                        raise ValueError("unsupported entity constructor")
+                    value.entities.add(types.SimpleNamespace(offset=stream.readInt32(True), length=stream.readInt32(True),
+                                                            document_id=stream.readInt64(True)))
+                return value
+
+        self.Text = Text
+        self.rpc = types.SimpleNamespace(TL_textWithEntities=Text)
+        self.module_patch = patch.dict(sys.modules, {"org.telegram.tgnet": fake_module("org.telegram.tgnet", TLRPC=self.rpc)})
+        self.module_patch.start()
+        self.stream_patch = patch.object(plugin, "native_stream", side_effect=self.stream)
+        self.stream_patch.start()
+
+    def tearDown(self):
+        self.stream_patch.stop()
+        self.module_patch.stop()
+
+    def stream(self, encoded):
+        value = Stream(base64.b64decode(encoded))
+        self.streams.append(value)
+        return value
+
+    def comment(self, data, text="ку"):
+        value = record(message=text, message_data=base64.b64encode(data).decode("ascii"))
+        return plugin.gift_comment(value, lambda *args: self.issues.append(args))
+
+    def test_exact_bare_desktop_comment_from_report_is_read(self):
+        data = bytes.fromhex("04d0bad18300000015c4b51c00000000")
+        self.assertEqual(struct.unpack_from("<I", data)[0], 0xd1bad004)
+        with self.assertRaisesRegex(ValueError, "unsupported text constructor"):
+            self.Text.TLdeserialize(Stream(data), 0xd1bad004, True)
+        value = self.comment(data)
+        self.assertEqual(value.text, "ку")
+        self.assertEqual(value.entities, [])
+        self.assertEqual(self.issues, [])
+        self.assertTrue(all(stream.closed for stream in self.streams))
+
+    def test_bare_and_boxed_custom_emoji_keep_large_ids_and_utf16_offsets(self):
+        body = plugin.tl_string("A🎉❤️") + struct.pack("<II", 0x1cb5c415, 2)
+        body += struct.pack("<Iiiq", 0xc8cf05f8, 1, 2, 6665644666666635010)
+        body += struct.pack("<Iiiq", 0xc8cf05f8, 3, 2, 6665644666666635011)
+        for data in (body, struct.pack("<I", 0x751f3146) + body):
+            with self.subTest(boxed=len(data) > len(body)):
+                value = self.comment(data, "A🎉❤️")
+                self.assertEqual([(entity.offset, entity.length, entity.document_id) for entity in value.entities],
+                                 [(1, 2, 6665644666666635010), (3, 2, 6665644666666635011)])
+        self.assertEqual(self.issues, [])
+
+    def test_long_tl_strings_with_emoji_are_not_mistaken_for_constructor(self):
+        text = "👑" * 70
+        body = plugin.tl_string(text) + struct.pack("<II", 0x1cb5c415, 0)
+        self.assertEqual(body[0], 254)
+        self.assertEqual(self.comment(body, text).text, text)
+        self.assertEqual(self.issues, [])
+
+    def test_bad_comment_encoding_keeps_text_instead_of_hiding_gift(self):
+        body = bytes.fromhex("04d0bad18300000015c4b51c00000000")
+        for data in (body[:-4], body + b"extra123", b"\x00" * 4,
+                     plugin.tl_string("wrong text") + struct.pack("<II", 0x1cb5c415, 0)):
+            with self.subTest(data=data):
+                value = self.comment(data)
+                self.assertEqual(value.text, "ку")
+                self.assertEqual(value.entities, [])
+        self.assertEqual(len(self.issues), 4)
+        self.assertTrue(all(stream.closed for stream in self.streams))
+
+    def test_unsupported_entity_does_not_abort_entire_gift(self):
+        body = plugin.tl_string("ку") + struct.pack("<IIIii", 0x1cb5c415, 1, 0x12345678, 0, 1)
+        value = self.comment(body)
+        self.assertEqual(value.text, "ку")
+        self.assertEqual(value.entities, [])
+        self.assertEqual(len(self.issues), 1)
+
+    def test_invalid_utf16_bounds_do_not_reach_native_span_renderer(self):
+        body = plugin.tl_string("ку") + struct.pack("<IIIiiq", 0x1cb5c415, 1, 0xc8cf05f8, 3, 2, 99999)
+        value = self.comment(body)
+        self.assertEqual(value.entities, [])
+        self.assertEqual(len(self.issues), 1)
 
 if __name__ == "__main__":
     unittest.main()

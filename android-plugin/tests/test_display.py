@@ -281,6 +281,42 @@ class DisplayTests(unittest.TestCase):
         self.subject._clear_display()
         self.assertIs(fragment.userInfo, original)
 
+    def test_profile_bootstrap_rebuilds_rows_when_gifts_arrive_in_empty_profile(self):
+        original, calls = DTO(stargifts_count=0), []
+        fragment = DTO(userInfo=original, sharedMediaLayout=None, sharedMediaRow=-1,
+                       getCurrentAccount=lambda: 0, getDialogId=lambda: 101)
+        self.subject._display_pages[self.key] = state([record()])
+        method = types.SimpleNamespace(invoke=lambda target: calls.append(target.userInfo.stargifts_count))
+        stars = types.ModuleType("org.telegram.ui.Stars")
+        stars.StarsController = types.SimpleNamespace(getInstance=lambda account: types.SimpleNamespace(getProfileGiftsList=lambda owner: None))
+        with patch.dict(sys.modules, {"org.telegram.ui.Stars": stars}), \
+             patch.object(self.subject, "_profile_context", return_value=(0, "101", "101")), \
+             patch.object(plugin, "clone_user_info", side_effect=lambda value: DTO(stargifts_count=value.stargifts_count)), \
+             patch.object(plugin, "find_method", return_value=method), patch.object(self.subject, "_rebind_visible"):
+            self.subject._display_visible(fragment)
+            self.subject._display_visible(fragment)
+        self.assertEqual(calls, [1])
+        self.assertEqual(original.stargifts_count, 0)
+
+    def test_profile_overlay_accepts_sdk_setter_without_return_value(self):
+        fragment = DTO(userInfo=DTO(stargifts_count=0), sharedMediaLayout=None)
+        self.subject._display_pages[self.key] = state([record()])
+        with patch.object(self.subject, "_profile_context", return_value=(0, "101", "101")), \
+             patch.object(plugin, "set_private_field", side_effect=lambda obj, name, value: setattr(obj, name, value)), \
+             patch.object(plugin, "clone_user_info", side_effect=lambda value: DTO(stargifts_count=value.stargifts_count)):
+            self.assertTrue(self.subject._overlay_profile(fragment))
+        self.assertEqual(fragment.userInfo.stargifts_count, 1)
+
+    def test_native_count_check_receives_real_count_and_preserves_view_copy(self):
+        original, overlay = DTO(stargifts_count=0), DTO(stargifts_count=52)
+        self.subject._display_views[1] = {"overlay": overlay, "original": original}
+        p = param(DTO(), overlay)
+        self.subject._display_hook("profile_count", p, True)
+        self.assertIs(p.args[0], original)
+        self.subject._display_hook("profile_count", p, False)
+        self.assertEqual(self.subject._display_suspended, 0)
+        self.assertEqual(overlay.stargifts_count, 52)
+
     def test_chat_reopens_without_duplicates_and_keeps_real_messages(self):
         real = Message(0, DTO(id=9, date=1700000400))
         fragment, key = self.chat([real]), (0, "101", "chat", "202")

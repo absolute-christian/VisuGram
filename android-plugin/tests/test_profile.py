@@ -268,7 +268,7 @@ class ProfileTests(unittest.TestCase):
                   and node.targets[0].id.startswith("__")}
         self.assertEqual(source.suffix, ".plugin")
         self.assertEqual(values["__sdk_version__"], ">=1.4.0")
-        self.assertEqual(values["__version__"], "0.4.0")
+        self.assertEqual(values["__version__"], "0.4.1")
 
     def test_legacy_editor_without_edittext_or_logger(self):
         self.assertIsNone(plugin.EditText)

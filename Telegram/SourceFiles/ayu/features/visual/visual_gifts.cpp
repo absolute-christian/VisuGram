@@ -163,7 +163,13 @@ template <typename Type = MTPStarGift>
 		const QJsonObject &object) {
 	const auto text = object.value(u"message"_q).toString();
 	const auto data = object.value(u"message_data"_q).toString().toLatin1();
-	if (const auto encoded = Decode<MTPTextWithEntities>(data)) {
+	auto encoded = Decode<MTPTextWithEntities>(data);
+	if (!encoded) {
+		if (const auto legacy = Decode<MTPtextWithEntities>(data)) {
+			encoded = MTPTextWithEntities(*legacy);
+		}
+	}
+	if (encoded) {
 		auto message = Api::ParseTextWithEntities(session, *encoded);
 		if (message.text == text) {
 			return message;
@@ -1469,9 +1475,10 @@ void RememberGiftSource(
 QString EncodeGiftMessage(
 		not_null<Main::Session*> session,
 		const TextWithEntities &message) {
-	return QString::fromLatin1(Encode(MTP_textWithEntities(
+	const auto encoded = MTPTextWithEntities(MTP_textWithEntities(
 		MTP_string(message.text),
-		Api::EntitiesToMTP(session, message.entities))));
+		Api::EntitiesToMTP(session, message.entities)));
+	return QString::fromLatin1(Encode(encoded));
 }
 
 void SendGift(

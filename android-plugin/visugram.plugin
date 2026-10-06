@@ -32,7 +32,7 @@ __id__ = "visugram"
 __name__ = "VisuGram Preview"
 __description__ = "Shared visual profiles and gifts. Uses the native gift shop."
 __author__ = "VisuGram"
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.0"
@@ -387,19 +387,52 @@ def gift_dialog(record, viewer):
         return record["recipient_id"]
     return record["sender_id"] if record["sender_id"] != "0" else viewer
 
-def gift_comment(record):
+def canonical_message_data(encoded, expected):
+    raw = base64.b64decode(encoded, validate=True)
+    if len(encoded) > 16384 or not raw or len(raw) % 4:
+        raise ValueError("INVALID_MESSAGE_DATA")
+    body = raw[4:] if raw[:4] == tl_int(0x751f3146) else raw
+    if not body:
+        raise ValueError("INVALID_MESSAGE_DATA")
+    length, prefix = body[0], 1
+    if length == 254:
+        if len(body) < 4:
+            raise ValueError("INVALID_MESSAGE_DATA")
+        length, prefix = int.from_bytes(body[1:4], "little"), 4
+    elif length == 255:
+        raise ValueError("INVALID_MESSAGE_DATA")
+    end = prefix + length
+    vector = end + (-end % 4)
+    if (vector + 8 > len(body) or body[prefix:end].decode("utf-8") != expected
+            or body[vector:vector + 4] != tl_int(0x1cb5c415)
+            or int.from_bytes(body[vector + 4:vector + 8], "little") > 256):
+        raise ValueError("INVALID_MESSAGE_DATA")
+    return tl_int(0x751f3146) + body
+
+def gift_comment(record, issue=None):
     from org.telegram.tgnet import TLRPC
 
     if not record["message"]:
         return None
     if record.get("message_data"):
-        stream = native_stream(record["message_data"])
+        stream = None
         try:
+            raw = canonical_message_data(record["message_data"], record["message"])
+            stream = native_stream(base64.b64encode(raw).decode("ascii"))
             message = TLRPC.TL_textWithEntities.TLdeserialize(stream, stream.readInt32(True), True)
-            if message is not None and str(message.text) == record["message"]:
+            if message is not None and str(message.text) == record["message"] and stream.getPosition() == len(raw):
+                length = len(record["message"].encode("utf-16-le")) // 2
+                if any(int(entity.offset) < 0 or int(entity.length) < 0 or int(entity.offset) + int(entity.length) > length
+                       for entity in java_items(message.entities)):
+                    raise ValueError("INVALID_MESSAGE_ENTITIES")
                 return message
+            raise ValueError("INVALID_MESSAGE_DATA")
+        except Exception as error:
+            if issue is not None:
+                issue("Gift comment", type(error).__name__ + ": unsupported formatting; text retained")
         finally:
-            stream.cleanup()
+            if stream is not None:
+                stream.cleanup()
     message = TLRPC.TL_textWithEntities()
     message.text = record["message"]
     return message
@@ -428,10 +461,10 @@ def visual_message_id(record):
     digest = hashlib.sha256(record["id"].encode("utf-8")).digest()
     return -0x40000000 - (int.from_bytes(digest[:4], "little") & 0x3fffffff)
 
-def native_saved_gift(record, title):
+def native_saved_gift(record, title, issue=None):
     from org.telegram.tgnet.tl import TL_stars
 
-    gift, message = decode_gift(record["source"]), gift_comment(record)
+    gift, message = decode_gift(record["source"]), gift_comment(record, issue)
     if str(gift.getClass().getSimpleName()).startswith("TL_starGiftUnique"):
         gift.owner_id, gift.owner_address, gift.gift_address = None, None, None
         gift.owner_name = title
@@ -859,6 +892,8 @@ class VisuGramPlugin(BasePlugin):
             ready = self._gift_hook("StarsController.buyResellingGift(" + str(len(resale_base + suffix)) + ")",
                                     controller, "buyResellingGift", resale_base + suffix, GiftBuyHook(self, True))
             self._gift_resale = self._gift_resale or ready
+        if self._gift_resale:
+            self._gift_diagnostics = [line for line in self._gift_diagnostics if not line.startswith("StarsController.buyResellingGift(")]
         self._gift_native = buy and premium
         balance = self._gift_hook("StarsController.getBalance", controller, "getBalance", [], GiftConfirmationBalanceHook(self))
         confirmation = self._gift_hook("ResaleBuyTransferAlert.show",
@@ -925,6 +960,11 @@ class VisuGramPlugin(BasePlugin):
                     self._merge_gift_list(target)
             elif action == "profile_count":
                 if before:
+                    for binding in self._display_views.values():
+                        overlay = binding.get("overlay")
+                        if overlay is not None and param.args[0] is not None and param.args[0].equals(overlay):
+                            param.args[0] = binding["original"]
+                            break
                     for binding in self._display_lists.values():
                         self._restore_gift_list(binding)
                     self._display_suspended += 1
@@ -934,7 +974,7 @@ class VisuGramPlugin(BasePlugin):
                 args = param.args[1]
                 if int(param.args[0]) == NotificationCenter.starUserGiftsLoaded and len(args) >= 2:
                     self._merge_gift_list(args[1])
-                    self._overlay_profile(get_last_fragment())
+                    self._display_visible()
             elif action == "chat_loaded" and not before and self._display_chat:
                 from org.telegram.messenger import NotificationCenter
 
@@ -1068,7 +1108,7 @@ class VisuGramPlugin(BasePlugin):
     def _saved_display(self, key, record):
         state = self._display_pages[key]
         if record["id"] not in state["objects"]:
-            state["objects"][record["id"]] = native_saved_gift(record, self._text("Visual gift", "Визуальный подарок"))
+            state["objects"][record["id"]] = native_saved_gift(record, self._text("Visual gift", "Визуальный подарок"), self._gift_hook_issue)
         saved = state["objects"][record["id"]]
         registry_key = key[0], int(saved.msg_id)
         existing = self._display_registry.get(registry_key)
@@ -1196,13 +1236,16 @@ class VisuGramPlugin(BasePlugin):
         if clone is None:
             return
         clone.stargifts_count = count
-        if not set_private_field(fragment, "userInfo", clone):
+        set_private_field(fragment, "userInfo", clone)
+        assigned = get_private_field(fragment, "userInfo")
+        if assigned is None or not assigned.equals(clone):
             raise ValueError("PROFILE_FIELD_UNAVAILABLE")
         self._display_views[identity] = {"ref": WeakReference(fragment), "key": key, "original": original, "overlay": clone}
         layout = get_private_field(fragment, "sharedMediaLayout")
         if layout is not None:
             layout.setUserInfo(clone)
         self._trim_display_views()
+        return True
 
     def _chat_context(self, fragment):
         if fragment is None or str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
@@ -1218,7 +1261,11 @@ class VisuGramPlugin(BasePlugin):
         try:
             fragment = fragment or get_last_fragment()
             if self._profile_context(fragment) is not None and self._display_profile:
-                self._overlay_profile(fragment)
+                changed = self._overlay_profile(fragment)
+                if changed:
+                    rows = find_method("org.telegram.ui.ProfileActivity", "updateRowsIds", [])
+                    if rows is not None:
+                        rows.invoke(fragment)
                 from org.telegram.ui.Stars import StarsController
 
                 StarsController.getInstance(int(fragment.getCurrentAccount())).getProfileGiftsList(int(fragment.getDialogId()))
@@ -1401,6 +1448,16 @@ class VisuGramPlugin(BasePlugin):
                              (self._text("Chat gift cards", "Карточки подарков в чате"), self._display_chat)):
             status = self._text("ready", "готово") if ready else self._text("unavailable", "недоступно")
             lines.append(title + ": " + status)
+        account = int(UserConfig.selectedAccount)
+        user = get_user_config(account).getCurrentUser()
+        if user is not None:
+            viewer = str(user.id)
+            pages = [state for key, state in self._display_pages.items() if key[:2] == (account, viewer)]
+            grid = sum(len(binding["ids"]) for binding in self._display_lists.values() if binding["key"][:2] == (account, viewer))
+            cards = sum(len(binding.get("messages", [])) for binding in self._display_views.values() if binding["key"][:2] == (account, viewer))
+            lines.append(self._text("Loaded gift records: ", "Загружено записей подарков: ") + str(sum(len(page["records"]) for page in pages)))
+            lines.append(self._text("Applied to grid: ", "Добавлено в сетку: ") + str(grid))
+            lines.append(self._text("Applied to chat: ", "Добавлено в чат: ") + str(cards))
         lines.extend(self._gift_diagnostics[:12])
         return "\n".join(lines)
 
@@ -1705,16 +1762,7 @@ class VisuGramPlugin(BasePlugin):
             if int(record["sender_id"]) > 0:
                 saved.flags |= 2
             if record["message"]:
-                message = None
-                if record.get("message_data"):
-                    stream = native_stream(record["message_data"])
-                    try:
-                        message = TLRPC.TL_textWithEntities.TLdeserialize(stream, stream.readInt32(True), True)
-                    finally:
-                        stream.cleanup()
-                if message is None or str(message.text) != record["message"]:
-                    message = TLRPC.TL_textWithEntities()
-                    message.text = record["message"]
+                message = gift_comment(record, self._gift_hook_issue)
                 saved.message, saved.flags = message, saved.flags | 4
             sheet = StarGiftSheet(fragment.getParentActivity(), int(UserConfig.selectedAccount), 0, fragment.getResourceProvider())
             sheet.set(saved, None)
@@ -2205,11 +2253,12 @@ class VisuGramPlugin(BasePlugin):
         cached = self._cache(str(user.id)) if user is not None else {}
         profile = cached.get("profile", validate_profile({}))
         return [
-            Header(text="VisuGram"),
+            Header(text="VisuGram " + __version__),
             Switch(key="sync_enabled", default=False, text=self._text("Synchronization", "Синхронизация"),
                    subtext=self._text("Sends Telegram ID and basic username to the VisuGram server.",
                                       "Передаёт Telegram ID и основной юзернейм серверу VisuGram."), on_change=self._toggle),
             Text(text=self._text("Refresh now", "Обновить сейчас"), on_click=lambda view: self._refresh(self._generation, True)),
+            Text(text=self._text("Gift compatibility", "Совместимость подарков"), on_click=lambda view: self._show_gift_report()),
             Text(text=self._text("Edit visual profile", "Изменить визуальный профиль"), create_sub_fragment=self._editor),
             Text(text=self._text("Usernames", "Юзернеймы"), subtext=", ".join("@" + name for name in profile["usernames"]) or "—"),
             Text(text=self._text("Phone number", "Номер телефона"), subtext=profile["phone"] or "—"),
@@ -2221,6 +2270,6 @@ class VisuGramPlugin(BasePlugin):
                      "Версия клиента не поддерживается. Общий профиль доступен в этих настройках.")),
             Text(text=self._text("Gift integration", "Интеграция подарков"),
                  subtext=self._text("Available", "Доступна") if self._gift_native else self._text("Unsupported client version", "Версия клиента не поддерживается")),
-            Divider(text=self._text("Preview: shared profiles, visual gift purchases and gift previews. Chat cards and profile gift grid are still being ported.",
-                                    "Предварительная версия: общий профиль, визуальные покупки и просмотр подарков. Карточки чата и сетка профиля ещё переносятся.")),
+            Divider(text=self._text("Preview: shared profiles, visual purchases, profile gift grid and local chat cards.",
+                                    "Предварительная версия: общий профиль, визуальные покупки, сетка подарков и локальные карточки в чате.")),
         ]
