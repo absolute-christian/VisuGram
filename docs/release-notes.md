@@ -1,20 +1,27 @@
 VisuGram Windows x64
 
-Скачай ZIP. Распакуй **VisuGram.exe** и папку **TelegramForcePortable** вместе, затем запусти EXE.
+Скачай ZIP и распакуй **VisuGram.exe** и **TelegramForcePortable** вместе в одну папку
 
-В этом апдейте:
+В этом обновлении:
 
-- Исправлено подключение к встроенному серверу после загрузки старых настроек.
-- В редакторе профиля видны статус синхронизации, ход сохранения и причины ошибок.
-- Отправка предупреждает, если подарок сохранён только на этом устройстве и получатель его не получит.
-- Исправлен формат комментариев для обмена с Android: новые записи содержат TL-заголовок, старые читаются с премиум-эмодзи.
+- Скрытые и перекрытые экраны откладывают обновление визуальных подарков
+- Закрытые профили больше не остаются на постоянном опросе сервера
+- Синхронизация реже работает в фоне и увеличивает интервал после ошибок соединения
+- Каталог обслуживает только видимые карточки при прокрутке
+- Устаревшие загрузки музыкальных обложек отменяются, одинаковые запросы объединяются
+- Ограничены кеши фильтрации и время выполнения регулярных выражений
+- Фоновое сохранение защищено от перезаписи устаревшими данными
+- Убраны лишние таймеры и подготовка невидимых подарков
 
-Основа — AyuGram 7.2.9. Визуальные подарки, номера и юзернеймы не меняют реальные активы Telegram. Автообновление клиента пока не доступно.
+Предварительная Debug-сборка на основе AyuGram 7.2.9
+Визуальные подарки, номера и юзернеймы не меняют реальные активы Telegram
 
 ---
 
-Extract **VisuGram.exe** and **TelegramForcePortable** into the same folder and launch the EXE.
+Extract **VisuGram.exe** and **TelegramForcePortable** into the same folder
 
-Legacy settings now use the built-in synchronization server. The profile editor shows connection status, save progress and errors. Sending a gift warns when it is saved only on this device. Gift comments now include their TL constructor for Android compatibility; older records retain custom emoji and formatting when read.
+This update reduces hidden-screen work, stops polling closed profiles, adapts background synchronization and connection retries, and keeps gift-card processing within the visible viewport
+Obsolete music-cover requests are cancelled and shared, filter caches and regular-expression work are bounded, and background saves cannot overwrite newer data
 
-Based on AyuGram 7.2.9. Visual assets do not change real Telegram ownership. Client auto-updates are not available yet.
+Preview Debug build based on AyuGram 7.2.9
+Visual assets do not change real Telegram ownership

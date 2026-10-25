@@ -5,32 +5,74 @@
 //
 // Copyright @Radolyn, 2026
 #include "ayu/ui/utils/itunes_search.h"
+#include "crl/crl_async.h"
+#include "crl/crl_on_main.h"
 
 #include <QtCore/QCache>
-#include <QtCore/QEventLoop>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
+#include <QtCore/QPointer>
 #include <QtCore/QRegularExpression>
+#include <QtCore/QThread>
 #include <QtCore/QTimer>
 #include <QtCore/QUrlQuery>
 #include <QtGui/QImage>
-#include <QtGui/QPixmap>
+#include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
+
+#include <atomic>
+#include <map>
 
 namespace Ayu::Ui::Itunes {
 namespace {
 
-struct CacheEntry
-{
-	QPixmap pix;
+constexpr auto kFailureCacheTime = crl::time(60 * 1000);
+constexpr auto kMaxResponseSize = 8 * 1024 * 1024;
+
+struct CacheEntry {
+	QImage image;
+	crl::time expires = 0;
 };
 
-QCache<QString, CacheEntry> &cache() {
-	static QCache<QString, CacheEntry> c(50);
-	return c;
-}
+struct CoverJob {
+	QPointer<QNetworkReply> reply;
+	QTimer timer;
+	std::map<uint64, Fn<void(QImage)>> subscribers;
+	std::shared_ptr<std::atomic_bool> cancelled =
+		std::make_shared<std::atomic_bool>(false);
+};
+
+class CoverService final : public QObject {
+public:
+	explicit CoverService(QObject *parent);
+	~CoverService() override;
+
+	[[nodiscard]] rpl::lifetime fetch(
+		QString performer,
+		QString title,
+		int size,
+		int timeout,
+		Fn<void(QImage)> done);
+
+private:
+	void request(
+		const QString &key,
+		const QUrl &url,
+		Fn<void(QByteArray)> done);
+	void decode(const QString &key, QByteArray bytes);
+	void finish(const QString &key, QImage image);
+	void cancel(const QString &key, uint64 subscriber);
+	[[nodiscard]] std::unique_ptr<CoverJob> takeJob(const QString &key);
+
+	QNetworkAccessManager _network;
+	QCache<QString, CacheEntry> _cache{ 50 };
+	std::map<QString, std::unique_ptr<CoverJob>> _jobs;
+	uint64 _nextSubscriber = 0;
+
+};
 
 QString translitSafe(const QString &s) {
 	static const QHash<QChar, QString> trMap = []
@@ -619,40 +661,6 @@ QStringList splitArtists(const QString &artists) {
 	return list;
 }
 
-std::unique_ptr<QNetworkReply, void(*)(QNetworkReply *)> execWithTimeout(
-	QNetworkAccessManager &nam,
-	const QNetworkRequest &req,
-	int timeoutMs) {
-	QNetworkReply *reply = nam.get(req);
-	QEventLoop loop;
-	QTimer timer;
-	timer.setSingleShot(true);
-	QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-	QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-	timer.start(timeoutMs);
-	loop.exec();
-	if (timer.isActive()) {
-		timer.stop();
-	} else {
-		reply->abort();
-	}
-	return {reply, [](QNetworkReply *r) { if (r) r->deleteLater(); }};
-}
-
-QByteArray getBytesWithTimeout(const QUrl &url, int timeoutMs, QByteArray *contentTypeOut = nullptr) {
-	QNetworkAccessManager nam;
-	QNetworkRequest req(url);
-	req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
-	auto replyPtr = execWithTimeout(nam, req, timeoutMs);
-	QNetworkReply *reply = replyPtr.get();
-	if (!reply) return {};
-	if (reply->error() != QNetworkReply::NoError) return {};
-	if (contentTypeOut) {
-		*contentTypeOut = reply->header(QNetworkRequest::ContentTypeHeader).toByteArray();
-	}
-	return reply->readAll();
-}
-
 struct ItunesTrack
 {
 	QString trackName;
@@ -711,40 +719,202 @@ QString upgradeArtworkSize(QString url, int sizeHint) {
 	return url;
 }
 
+CoverService::CoverService(QObject *parent)
+: QObject(parent) {
+}
+
+CoverService::~CoverService() {
+	while (!_jobs.empty()) {
+		const auto job = takeJob(_jobs.begin()->first);
+	}
+}
+
+rpl::lifetime CoverService::fetch(
+		QString performer,
+		QString title,
+		int size,
+		int timeout,
+		Fn<void(QImage)> done) {
+	Expects(QThread::currentThread() == thread());
+	performer = performer.trimmed();
+	title = title.trimmed();
+	if (performer.isEmpty() && title.isEmpty()) {
+		done({});
+		return {};
+	}
+	size = (size >= 600) ? 600 : 300;
+	const auto key = QString::number(performer.size())
+		+ u":"_q + performer + title + u":"_q + QString::number(size);
+	if (const auto cached = _cache.object(key)) {
+		if (!cached->expires || cached->expires > crl::now()) {
+			done(cached->image);
+			return {};
+		}
+		_cache.remove(key);
+	}
+	const auto subscriber = ++_nextSubscriber;
+	auto i = _jobs.find(key);
+	const auto fresh = (i == _jobs.end());
+	if (fresh) {
+		i = _jobs.emplace(key, std::make_unique<CoverJob>()).first;
+	}
+	i->second->subscribers.emplace(subscriber, std::move(done));
+	if (fresh) {
+		i->second->timer.setSingleShot(true);
+		connect(&i->second->timer, &QTimer::timeout, this, [=] {
+			finish(key, {});
+		});
+		i->second->timer.start(std::max(timeout, 1));
+		request(key, buildItunesUrl(performer, title), [=](QByteArray bytes) {
+			const auto tracks = parseTracks(bytes);
+			const auto artwork = upgradeArtworkSize(
+				pickArtworkUrl(tracks, title, splitArtists(performer)),
+				size);
+			if (artwork.isEmpty()) {
+				finish(key, {});
+				return;
+			}
+			request(key, QUrl(artwork), [=](QByteArray bytes) {
+				decode(key, std::move(bytes));
+			});
+		});
+	}
+	return [weak = QPointer<CoverService>(this), key, subscriber] {
+		if (weak) {
+			weak->cancel(key, subscriber);
+		}
+	};
+}
+
+void CoverService::request(
+		const QString &key,
+		const QUrl &url,
+		Fn<void(QByteArray)> done) {
+	const auto i = _jobs.find(key);
+	if (i == _jobs.end()) {
+		return;
+	}
+	auto request = QNetworkRequest(url);
+	request.setAttribute(
+		QNetworkRequest::RedirectPolicyAttribute,
+		QNetworkRequest::NoLessSafeRedirectPolicy);
+	const auto reply = _network.get(request);
+	i->second->reply = reply;
+	connect(reply, &QNetworkReply::readyRead, this, [=] {
+		const auto i = _jobs.find(key);
+		if (i != _jobs.end()
+			&& i->second->reply == reply
+			&& reply->bytesAvailable() > kMaxResponseSize) {
+			finish(key, {});
+		}
+	});
+	connect(reply, &QNetworkReply::finished, this, [=] {
+		const auto i = _jobs.find(key);
+		if (i == _jobs.end() || i->second->reply != reply) {
+			return;
+		}
+		i->second->reply = nullptr;
+		reply->deleteLater();
+		if (reply->error() != QNetworkReply::NoError
+			|| reply->bytesAvailable() > kMaxResponseSize) {
+			finish(key, {});
+			return;
+		}
+		done(reply->readAll());
+	});
+}
+
+void CoverService::decode(const QString &key, QByteArray bytes) {
+	const auto i = _jobs.find(key);
+	if (i == _jobs.end()) {
+		return;
+	}
+	const auto cancelled = i->second->cancelled;
+	const auto weak = QPointer<CoverService>(this);
+	crl::async([=, bytes = std::move(bytes)] {
+		if (cancelled->load()) {
+			return;
+		}
+		auto image = QImage::fromData(bytes);
+		if (cancelled->load()) {
+			return;
+		}
+		crl::on_main([=, image = std::move(image)]() mutable {
+			if (weak && !cancelled->load()) {
+				weak->finish(key, std::move(image));
+			}
+		});
+	});
+}
+
+std::unique_ptr<CoverJob> CoverService::takeJob(const QString &key) {
+	const auto i = _jobs.find(key);
+	if (i == _jobs.end()) {
+		return nullptr;
+	}
+	auto job = std::move(i->second);
+	_jobs.erase(i);
+	job->cancelled->store(true);
+	job->timer.stop();
+	if (const auto reply = job->reply.data()) {
+		reply->disconnect(this);
+		reply->abort();
+		reply->deleteLater();
+	}
+	return job;
+}
+
+void CoverService::finish(const QString &key, QImage image) {
+	const auto job = takeJob(key);
+	if (!job) {
+		return;
+	}
+	_cache.insert(key, new CacheEntry{
+		.image = image,
+		.expires = image.isNull() ? crl::now() + kFailureCacheTime : 0,
+	});
+	for (const auto &subscriber : job->subscribers) {
+		subscriber.second(image);
+	}
+}
+
+void CoverService::cancel(const QString &key, uint64 subscriber) {
+	const auto i = _jobs.find(key);
+	if (i == _jobs.end()) {
+		return;
+	}
+	i->second->subscribers.erase(subscriber);
+	if (i->second->subscribers.empty()) {
+		const auto job = takeJob(key);
+	}
+}
+
+CoverService &Service() {
+	const auto application = QCoreApplication::instance();
+	Expects(application != nullptr);
+	Expects(QThread::currentThread() == application->thread());
+	static const auto service = new CoverService(application);
+	return *service;
+}
+
 } // namespace
 
-QPixmap FetchCover(const QString &performer, const QString &title, int sizeHintPx, int timeoutMs) {
-	const auto perf = performer.trimmed();
-	const auto titl = title.trimmed();
-	if (perf.isEmpty() && titl.isEmpty()) return {};
-
-	const auto key = perf + QString::fromUtf8(" - ") + titl;
-	if (auto *entry = cache().object(key)) {
-		return entry->pix;
-	}
-
-	const auto url = buildItunesUrl(perf, titl);
-	const auto json = getBytesWithTimeout(url, timeoutMs);
-	if (json.isEmpty()) return {};
-	const auto tracks = parseTracks(json);
-	if (tracks.isEmpty()) return {};
-
-	const auto baseArtists = splitArtists(perf);
-	auto artwork = pickArtworkUrl(tracks, titl, baseArtists);
-	artwork = upgradeArtworkSize(std::move(artwork), sizeHintPx);
-	if (artwork.isEmpty()) return {};
-
-	QByteArray contentType;
-	const auto imgBytes = getBytesWithTimeout(QUrl(artwork), timeoutMs, &contentType);
-	if (imgBytes.isEmpty()) return {};
-
-	QImage img;
-	if (!img.loadFromData(imgBytes)) return {};
-	QPixmap pix = QPixmap::fromImage(img);
-
-	auto *stored = new CacheEntry{pix};
-	cache().insert(key, stored);
-	return pix;
+rpl::producer<QImage> FetchCover(
+		const QString &performer,
+		const QString &title,
+		int sizeHintPx,
+		int timeoutMs) {
+	return [=](auto consumer) {
+		return Service().fetch(
+			performer,
+			title,
+			sizeHintPx,
+			timeoutMs,
+			[=](QImage image) {
+				consumer.put_next(std::move(image));
+				consumer.put_done();
+			});
+	};
 }
 
-}
+} // namespace Ayu::Ui::Itunes

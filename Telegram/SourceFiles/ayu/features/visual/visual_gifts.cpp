@@ -3,6 +3,8 @@
 #include "api/api_premium.h"
 #include "api/api_text_entities.h"
 #include "base/unixtime.h"
+#include "crl/crl_async.h"
+#include "crl/crl_on_main.h"
 #include "data/components/credits.h"
 #include "data/data_changes.h"
 #include "data/data_emoji_statuses.h"
@@ -19,14 +21,18 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
+#include <QtCore/QPointer>
 #include <QtCore/QSaveFile>
 #include <QtCore/QTimer>
 #include <QtCore/QUuid>
+#include <QtGui/QGuiApplication>
 #include <QtNetwork/QNetworkAccessManager>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QNetworkRequest>
 
+#include <atomic>
 #include <deque>
+#include <mutex>
 
 namespace Ayu::Visual {
 namespace {
@@ -39,6 +45,35 @@ constexpr auto kMaxPinned = 6;
 constexpr auto kResourceRetryDelay = crl::time(60 * 1000);
 constexpr auto kSyncInterval = crl::time(5 * 1000);
 constexpr auto kBackgroundSyncInterval = crl::time(60 * 1000);
+constexpr auto kMaxSyncRetryInterval = crl::time(5 * 60 * 1000);
+
+struct Update {
+	PeerId peer;
+	Change change = Change::All;
+};
+
+struct Storage {
+	std::mutex mutex;
+	std::atomic<uint64> revision = 0;
+};
+
+[[nodiscard]] std::shared_ptr<Storage> StorageForPath(const QString &path) {
+	static auto stores = std::map<QString, std::weak_ptr<Storage>>();
+	for (auto i = begin(stores); i != end(stores);) {
+		if (i->second.expired()) {
+			i = stores.erase(i);
+		} else {
+			++i;
+		}
+	}
+	auto &entry = stores[path];
+	auto result = entry.lock();
+	if (!result) {
+		result = std::make_shared<Storage>();
+		entry = result;
+	}
+	return result;
+}
 
 struct Record {
 	MTPStarGift source;
@@ -58,8 +93,12 @@ struct Record {
 class State final {
 public:
 	explicit State(not_null<Main::Session*> session);
-	[[nodiscard]] bool save();
-	void notify();
+	~State();
+	[[nodiscard]] bool save(bool localChanged = false);
+	void saveBackground();
+	void notify(PeerId peer, Change change);
+	void notifyGifts();
+	void scheduleSync(bool immediate = false);
 	void updateWornStatuses();
 	void acceptMutation(QJsonObject object, bool newlySent = false);
 	void loadRecords();
@@ -86,7 +125,7 @@ public:
 	const not_null<Main::Session*> session;
 	MTP::Sender api;
 	rpl::variable<bool> enabled = false;
-	rpl::event_stream<> changes;
+	rpl::event_stream<Update> changes;
 	QString phone;
 	QStringList usernames;
 	std::vector<Record> records;
@@ -95,8 +134,9 @@ public:
 	std::map<MsgId, size_t> recordIndex;
 	QJsonArray unreadableRecords;
 	QJsonArray pendingRecords;
-	std::vector<Data::SavedStarGiftId> resourceQueue;
-	std::vector<mtpRequestId> resourceRequests;
+	std::deque<Data::SavedStarGiftId> resourceQueue;
+	std::map<MsgId, mtpRequestId> resourceRequests;
+	uint64 resourceGeneration = 0;
 	std::map<QString, MTPStarGift> giftSources;
 	std::deque<QString> giftSourceOrder;
 	base::flat_set<PeerId> restoredPeers;
@@ -106,6 +146,11 @@ public:
 	bool catalogRefreshed = false;
 	QNetworkAccessManager network;
 	QTimer syncTimer;
+	std::shared_ptr<Storage> storage;
+	QJsonArray localSnapshot;
+	bool localSnapshotDirty = true;
+	bool storageDirty = false;
+	int syncFailures = 0;
 	QString endpoint;
 	QString cursor;
 	QString primary;
@@ -117,7 +162,9 @@ public:
 	std::map<PeerId, QJsonObject> remoteProfiles;
 	std::map<PeerId, crl::time> remoteAttempts;
 	base::flat_set<PeerId> remoteLoading;
-	PeerId watchedPeer;
+	std::map<PeerId, base::flat_set<uint64>> observers;
+	uint64 nextObserverId = 0;
+	base::flat_set<PeerId> changedGiftPeers;
 	bool syncing = false;
 	bool profileSaving = false;
 	rpl::variable<QString> syncStatus = u"CONNECTING"_q;
@@ -127,6 +174,7 @@ public:
 private:
 	[[nodiscard]] QString path() const;
 	void load();
+	[[nodiscard]] QJsonObject snapshot();
 
 };
 
@@ -215,16 +263,49 @@ template <typename Type = MTPStarGift>
 State::State(not_null<Main::Session*> session)
 : session(session)
 , api(&session->mtp()) {
+	storage = StorageForPath(path());
 	load();
+	syncTimer.setSingleShot(true);
 	QObject::connect(&syncTimer, &QTimer::timeout, &network, [this] {
 		sync();
-		if (watchedPeer && enabled.current()) {
-			view(this->session->data().peer(watchedPeer));
+		if (enabled.current()
+			&& QGuiApplication::applicationState() == Qt::ApplicationActive) {
+			const auto watching = observers;
+			for (const auto &[peer, tokens] : watching) {
+				if (!tokens.empty()) {
+					view(this->session->data().peer(peer));
+				}
+			}
 		}
+		scheduleSync();
 	});
-	syncTimer.start(int(enabled.current()
-		? kSyncInterval : kBackgroundSyncInterval));
-	QTimer::singleShot(0, &network, [this] { sync(); });
+	if (const auto app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+		QObject::connect(app, &QGuiApplication::applicationStateChanged,
+			&network, [this](Qt::ApplicationState state) {
+				scheduleSync(state == Qt::ApplicationActive);
+			});
+	}
+	scheduleSync(true);
+}
+
+State::~State() {
+	const auto lock = std::lock_guard(storage->mutex);
+	++storage->revision;
+}
+
+void State::scheduleSync(bool immediate) {
+	if (endpoint.isEmpty()) {
+		syncTimer.stop();
+		return;
+	}
+	auto interval = enabled.current()
+		&& QGuiApplication::applicationState() == Qt::ApplicationActive
+		? kSyncInterval : kBackgroundSyncInterval;
+	if (syncFailures) {
+		interval = std::min(kMaxSyncRetryInterval,
+			interval * (crl::time(1) << std::min(syncFailures, 6)));
+	}
+	syncTimer.start(immediate ? 0 : int(interval));
 }
 
 QString State::path() const {
@@ -326,40 +407,41 @@ void State::loadRecords() {
 			&& object.value(u"worn"_q).toBool();
 	}
 	if (loaded) {
+		localSnapshotDirty = true;
 		updateWornStatuses();
 	}
 }
 
-bool State::save() {
-	if (!writable) {
-		return false;
-	}
-	auto gifts = unreadableRecords;
-	for (const auto &value : pendingRecords) {
-		gifts.push_back(value);
-	}
-	for (const auto &record : records) {
-		if (!record.serverId.isEmpty()) {
-			continue;
+QJsonObject State::snapshot() {
+	if (localSnapshotDirty) {
+		localSnapshot = unreadableRecords;
+		for (const auto &value : pendingRecords) {
+			localSnapshot.push_back(value);
 		}
-		const auto &gift = record.gift;
-		gifts.push_back(QJsonObject{
-			{ u"source"_q, QString::fromLatin1(record.encodedSource) },
-			{ u"recipient"_q, QString::number(record.recipient.value) },
-			{ u"message"_q, gift.message.text },
-			{ u"message_data"_q, EncodeGiftMessage(session, gift.message) },
-			{ u"date"_q, int(gift.date) },
-			{ u"anonymous"_q, gift.anonymous },
-			{ u"pinned"_q, gift.pinned },
-			{ u"hidden"_q, gift.hidden },
-			{ u"worn"_q, record.worn },
-			{ u"local_only"_q, record.localOnly },
-			{ u"price_whole"_q, QString::number(record.price.whole()) },
-			{ u"price_nano"_q, int(record.price.nano()) },
-			{ u"price_ton"_q, record.price.ton() },
-		});
+		for (const auto &record : records) {
+			if (!record.serverId.isEmpty()) {
+				continue;
+			}
+			const auto &gift = record.gift;
+			localSnapshot.push_back(QJsonObject{
+				{ u"source"_q, QString::fromLatin1(record.encodedSource) },
+				{ u"recipient"_q, QString::number(record.recipient.value) },
+				{ u"message"_q, gift.message.text },
+				{ u"message_data"_q, EncodeGiftMessage(session, gift.message) },
+				{ u"date"_q, int(gift.date) },
+				{ u"anonymous"_q, gift.anonymous },
+				{ u"pinned"_q, gift.pinned },
+				{ u"hidden"_q, gift.hidden },
+				{ u"worn"_q, record.worn },
+				{ u"local_only"_q, record.localOnly },
+				{ u"price_whole"_q, QString::number(record.price.whole()) },
+				{ u"price_nano"_q, int(record.price.nano()) },
+				{ u"price_ton"_q, record.price.ton() },
+			});
+		}
+		localSnapshotDirty = false;
 	}
-	const auto bytes = QJsonDocument(QJsonObject{
+	return QJsonObject{
 		{ u"version"_q, kVersion },
 		{ u"account"_q, QString::number(session->uniqueId()) },
 		{ u"enabled"_q, enabled.current() },
@@ -372,21 +454,89 @@ bool State::save() {
 		{ u"primary"_q, primary },
 		{ u"phone"_q, phone },
 		{ u"usernames"_q, QJsonArray::fromStringList(usernames) },
-		{ u"gifts"_q, gifts },
-	}).toJson(QJsonDocument::Compact);
+		{ u"gifts"_q, localSnapshot },
+	};
+}
+
+[[nodiscard]] std::optional<bool> WriteSnapshot(
+		const std::shared_ptr<Storage> &storage,
+		uint64 revision,
+		const QString &path,
+		const QJsonObject &snapshot) {
+	if (storage->revision.load() != revision) {
+		return std::nullopt;
+	}
+	const auto bytes = QJsonDocument(snapshot).toJson(QJsonDocument::Compact);
+	const auto lock = std::lock_guard(storage->mutex);
+	if (storage->revision.load() != revision) {
+		return std::nullopt;
+	}
 	if (bytes.size() > kMaxFileSize
-		|| !QDir().mkpath(cWorkingDir() + u"tdata/ayu/visual"_q)) {
+		|| !QDir().mkpath(path.left(path.lastIndexOf('/')))) {
 		return false;
 	}
-	auto file = QSaveFile(path());
+	auto file = QSaveFile(path);
 	return file.open(QIODevice::WriteOnly)
 		&& file.write(bytes) == bytes.size()
 		&& file.commit();
 }
 
-void State::notify() {
+bool State::save(bool localChanged) {
+	localSnapshotDirty |= localChanged;
+	if (!writable) {
+		return false;
+	}
+	const auto revision = ++storage->revision;
+	const auto result = WriteSnapshot(storage, revision, path(), snapshot());
+	storageDirty = !result.value_or(false);
+	localSnapshotDirty |= storageDirty && localChanged;
+	return !storageDirty;
+}
+
+void State::saveBackground() {
+	if (!writable) {
+		syncStatus = u"STORAGE_ERROR"_q;
+		return;
+	}
+	const auto revision = ++storage->revision;
+	const auto storage = this->storage;
+	const auto path = this->path();
+	const auto snapshot = this->snapshot();
+	const auto guard = QPointer<QNetworkAccessManager>(&network);
+	storageDirty = true;
+	crl::async([=] {
+		const auto result = WriteSnapshot(storage, revision, path, snapshot);
+		crl::on_main(guard, [=] {
+			if (!result || storage->revision.load() != revision) {
+				return;
+			}
+			storageDirty = !*result;
+			if (storageDirty) {
+				syncStatus = u"STORAGE_ERROR"_q;
+			}
+		});
+	});
+}
+
+void State::notify(PeerId peer, Change change) {
+	if (change == Change::All && !peer) {
+		changedGiftPeers.clear();
+	}
+	if (change != Change::Profile) {
+		updateWornStatuses();
+	}
+	changes.fire({ peer, change });
+}
+
+void State::notifyGifts() {
+	const auto peers = base::take(changedGiftPeers);
+	if (peers.empty()) {
+		return;
+	}
 	updateWornStatuses();
-	changes.fire({});
+	for (const auto peer : peers) {
+		changes.fire({ peer, Change::Gifts });
+	}
 }
 
 void State::updateWornStatuses() {
@@ -664,6 +814,8 @@ void State::sync() {
 	}, [=](QJsonObject object, QString error) {
 		syncing = false;
 		syncStatus = error.isEmpty() ? u"CONNECTED"_q : error;
+		syncFailures = error.isEmpty() ? 0 : std::min(syncFailures + 1, 6);
+		scheduleSync();
 		if (pendingProfileSave) {
 			QTimer::singleShot(0, &network, [this] {
 				if (const auto save = base::take(pendingProfileSave)) {
@@ -671,7 +823,13 @@ void State::sync() {
 				}
 			});
 		}
-		if (!error.isEmpty() || object.value(u"unchanged"_q).toBool()) {
+		if (!error.isEmpty()) {
+			return;
+		}
+		if (object.value(u"unchanged"_q).toBool()) {
+			if (storageDirty) {
+				saveBackground();
+			}
 			return;
 		}
 		const auto previousProfile = ownProfile;
@@ -680,23 +838,20 @@ void State::sync() {
 		ownProfile = object.value(u"profile"_q).toObject();
 		serverGifts = object.value(u"gifts"_q).toArray();
 		cursor = object.value(u"cursor"_q).toString();
-		if (!save()) {
-			syncStatus = u"STORAGE_ERROR"_q;
-			ownProfile = previousProfile;
-			serverGifts = previousGifts;
-			cursor = previousCursor;
-			return;
+		if (ownProfile != previousProfile || serverGifts != previousGifts
+			|| cursor != previousCursor || storageDirty) {
+			saveBackground();
 		}
-		if (ownProfile == previousProfile && serverGifts == previousGifts) {
-			return;
+		if (serverGifts != previousGifts) {
+			pendingServerGifts = serverGifts;
+			if (enabled.current()) {
+				applyServerGifts(previousGifts, !previousCursor.isEmpty());
+				notifyGifts();
+			}
 		}
-		pendingServerGifts = serverGifts;
-		if (enabled.current()) {
-			applyServerGifts(previousGifts, !previousCursor.isEmpty());
-			restoredPeers.clear();
-			restoreMessages();
+		if (ownProfile != previousProfile) {
+			notify(session->userPeerId(), Change::Profile);
 		}
-		notify();
 	});
 }
 
@@ -715,9 +870,6 @@ QJsonObject State::profile(not_null<PeerData*> peer) {
 }
 
 void State::view(not_null<PeerData*> peer) {
-	if (peer->isUser() && !peer->isSelf()) {
-		watchedPeer = peer->id;
-	}
 	if (!enabled.current() || endpoint.isEmpty() || !peer->isUser()
 		|| peer->isSelf() || remoteLoading.contains(peer->id)) {
 		return;
@@ -746,13 +898,18 @@ void State::view(not_null<PeerData*> peer) {
 		if (previous != end(remoteProfiles) && previous->second == object) {
 			return;
 		}
+		const auto previousProfile = previous != end(remoteProfiles)
+			? previous->second.value(u"profile"_q) : QJsonValue();
+		const auto previousGifts = previous != end(remoteProfiles)
+			? previous->second.value(u"gifts"_q) : QJsonValue();
 		remoteProfiles[peer->id] = std::move(object);
 		const auto visible = remoteProfiles[peer->id].value(u"gifts"_q).toArray();
+		auto visibleIds = base::flat_set<QString>();
 		auto wornId = QString();
 		for (const auto &value : visible) {
+			visibleIds.emplace(value.toObject().value(u"id"_q).toString());
 			if (value.toObject().value(u"worn"_q).toBool()) {
 				wornId = value.toObject().value(u"id"_q).toString();
-				break;
 			}
 		}
 		for (auto &record : records) {
@@ -760,10 +917,16 @@ void State::view(not_null<PeerData*> peer) {
 				&& record.serverId != wornId) {
 				record.worn = false;
 			}
+			if (record.recipient == peer->id && !record.serverId.isEmpty()
+				&& record.sender != session->userPeerId()
+				&& !visibleIds.contains(record.serverId)) {
+				record.active = false;
+				wornStatusesDirty = true;
+			}
 		}
 		for (const auto &value : visible) {
+			acceptGift(value.toObject());
 			if (value.toObject().value(u"worn"_q).toBool()) {
-				acceptGift(value.toObject());
 				const auto worn = findServerRecord(
 					value.toObject().value(u"id"_q).toString());
 				if (worn != end(records)) {
@@ -771,7 +934,13 @@ void State::view(not_null<PeerData*> peer) {
 				}
 			}
 		}
-		notify();
+		if (previousGifts != remoteProfiles[peer->id].value(u"gifts"_q)) {
+			changedGiftPeers.emplace(peer->id);
+			notifyGifts();
+		}
+		if (previousProfile != remoteProfiles[peer->id].value(u"profile"_q)) {
+			notify(peer->id, Change::Profile);
+		}
 	});
 }
 
@@ -860,6 +1029,7 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 	}
 	if (found != end(records)) {
 		gift.manageId = found->gift.manageId;
+		changedGiftPeers.emplace(found->recipient);
 		removeMessage(*found);
 		*found = Record{ *source, gift, recipient, Encode(*source), price, sender, id, active };
 	} else {
@@ -874,9 +1044,19 @@ void State::acceptGift(QJsonObject object, bool newlySent) {
 	serverVersions[id] = std::move(object);
 	found->worn = active && serverVersions[id].value(u"worn"_q).toBool();
 	wornStatusesDirty = true;
-	if (enabled.current() && newlySent) {
-		const auto chat = recipient == session->userPeerId() ? sender : recipient;
-		restoreMessage(*found, session->data().history(chat), true);
+	changedGiftPeers.emplace(recipient);
+	if (enabled.current()
+		&& (sender == session->userPeerId() || recipient == session->userPeerId())) {
+		const auto chat = (recipient == session->userPeerId() && sender) ? sender : recipient;
+		restoredPeers.erase(chat);
+		const auto history = newlySent
+			? session->data().history(chat).get()
+			: session->data().historyLoaded(chat);
+		if (history && (newlySent || !history->isEmpty()
+			|| (history->loadedAtTop() && history->loadedAtBottom()))) {
+			restoreMessage(*found, history, newlySent);
+			history->checkLocalMessages();
+		}
 	}
 }
 
@@ -918,10 +1098,10 @@ void State::acceptMutation(QJsonObject object, bool newlySent) {
 	};
 	accept(object.value(u"previous"_q).toObject(), false);
 	accept(object.value(u"gift"_q).toObject(), newlySent);
-	(void)save();
-	restoredPeers.clear();
-	restoreMessages();
-	notify();
+	if (!save()) {
+		syncStatus = u"STORAGE_ERROR"_q;
+	}
+	notifyGifts();
 	sync();
 }
 
@@ -982,13 +1162,18 @@ void State::refreshGift(Data::SavedStarGiftId id) {
 void State::requestNextResource() {
 	while (enabled.current() && resourcesLoading < 2 && !resourceQueue.empty()) {
 		const auto id = resourceQueue.front();
-		resourceQueue.erase(begin(resourceQueue));
+		resourceQueue.pop_front();
 		const auto found = Find(*this, id);
 		if (found == end(records)) {
 			continue;
 		}
 		++resourcesLoading;
+		const auto generation = resourceGeneration;
 		const auto finish = [=](bool success) {
+			if (generation != resourceGeneration) {
+				return;
+			}
+			resourceRequests.erase(id.userMessageId());
 			--resourcesLoading;
 			if (!success) {
 				const auto found = Find(*this, id);
@@ -1001,21 +1186,25 @@ void State::requestNextResource() {
 		const auto failed = [=](const MTP::Error &) { finish(false); };
 		const auto &unique = found->gift.info.unique;
 		if (unique && !unique->slug.startsWith(u"Visual-")) {
-			resourceRequests.push_back(api.request(MTPpayments_GetUniqueStarGift(
+			resourceRequests[id.userMessageId()] = api.request(MTPpayments_GetUniqueStarGift(
 				MTP_string(unique->slug)
 			)).done([=](const MTPpayments_UniqueStarGift &result) {
+				if (generation != resourceGeneration) {
+					return;
+				}
 				const auto &source = result.data().vgift();
 				(void)Api::FromTL(session, source);
 				const auto found = Find(*this, id);
 				if (found != end(records)) {
 					found->source = source;
 					found->encodedSource = Encode(source);
+					localSnapshotDirty |= found->serverId.isEmpty();
 				}
 				finish(true);
-			}).fail(failed).send());
+			}).fail(failed).send();
 		} else if (unique) {
 			using Flag = MTPpayments_GetResaleStarGifts::Flag;
-			resourceRequests.push_back(api.request(MTPpayments_GetResaleStarGifts(
+			resourceRequests[id.userMessageId()] = api.request(MTPpayments_GetResaleStarGifts(
 				MTP_flags(Flag::f_attributes_hash),
 				MTP_long(0),
 				MTP_long(unique->initialGiftId),
@@ -1023,6 +1212,9 @@ void State::requestNextResource() {
 				MTP_string(QString()),
 				MTP_int(1)
 			)).done([=](const MTPpayments_ResaleStarGifts &result) {
+				if (generation != resourceGeneration) {
+					return;
+				}
 				const auto attributes = result.data().vattributes();
 				if (attributes) {
 					for (const auto &attribute : attributes->v) {
@@ -1034,11 +1226,14 @@ void State::requestNextResource() {
 					}
 				}
 				finish(true);
-			}).fail(failed).send());
+			}).fail(failed).send();
 		} else {
-			resourceRequests.push_back(api.request(MTPpayments_GetStarGifts(
+			resourceRequests[id.userMessageId()] = api.request(MTPpayments_GetStarGifts(
 				MTP_int(0)
 			)).done([=](const MTPpayments_StarGifts &result) {
+				if (generation != resourceGeneration) {
+					return;
+				}
 				if (result.type() == mtpc_payments_starGifts) {
 					for (const auto &source : result.c_payments_starGifts().vgifts().v) {
 						(void)Api::FromTL(session, source);
@@ -1046,9 +1241,12 @@ void State::requestNextResource() {
 				}
 				finish(true);
 			}).fail([=](const MTP::Error &) {
+				if (generation != resourceGeneration) {
+					return;
+				}
 				catalogRefreshed = false;
 				finish(false);
-			}).send());
+			}).send();
 		}
 	}
 }
@@ -1099,8 +1297,55 @@ rpl::producer<bool> EnabledValue(not_null<Main::Session*> session) {
 	return Get(session).enabled.value();
 }
 
-rpl::producer<> Changes(not_null<Main::Session*> session) {
-	return Get(session).changes.events();
+rpl::producer<> PeerChanges(not_null<PeerData*> peer, Change change) {
+	return Get(&peer->session()).changes.events()
+		| rpl::filter([=](const Update &update) {
+			return (!update.peer || update.peer == peer->id)
+				&& (update.change == Change::All || change == Change::All
+					|| update.change == change);
+		}) | rpl::to_empty;
+}
+
+void ObservePeer(
+		not_null<PeerData*> peer,
+		rpl::producer<bool> visible,
+		rpl::lifetime &lifetime) {
+	const auto session = &peer->session();
+	const auto peerId = peer->id;
+	const auto token = ++Get(session).nextObserverId;
+	std::move(visible) | rpl::distinct_until_changed() | rpl::on_next([=](bool shown) {
+		const auto found = States().find(session);
+		if (found == end(States())) {
+			return;
+		}
+		auto &state = *found->second;
+		if (shown) {
+			state.observers[peerId].emplace(token);
+			state.view(peer);
+		} else {
+			const auto i = state.observers.find(peerId);
+			if (i != end(state.observers)) {
+				i->second.erase(token);
+				if (i->second.empty()) {
+					state.observers.erase(i);
+				}
+			}
+		}
+	}, lifetime);
+	lifetime.add([=] {
+		const auto found = States().find(session);
+		if (found == end(States())) {
+			return;
+		}
+		auto &watching = found->second->observers;
+		const auto i = watching.find(peerId);
+		if (i != end(watching)) {
+			i->second.erase(token);
+			if (i->second.empty()) {
+				watching.erase(i);
+			}
+		}
+	});
 }
 
 EmojiStatusId WornStatus(not_null<const PeerData*> peer) {
@@ -1129,11 +1374,12 @@ bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 		state.enabled = previous;
 		return false;
 	}
-	state.syncTimer.start(int(enabled ? kSyncInterval : kBackgroundSyncInterval));
+	state.scheduleSync();
 	if (enabled) {
 		state.restoreMessages();
 	} else {
-		for (const auto request : state.resourceRequests) {
+		++state.resourceGeneration;
+		for (const auto &[id, request] : state.resourceRequests) {
 			state.api.request(request).cancel();
 		}
 		state.resourceRequests.clear();
@@ -1149,7 +1395,7 @@ bool SetEnabled(not_null<Main::Session*> session, bool enabled) {
 			state.removeMessage(record);
 		}
 	}
-	state.notify();
+	state.notify({}, Change::All);
 	if (enabled) {
 		state.sync();
 	}
@@ -1244,7 +1490,7 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 	state.serverRecordIds.clear();
 	state.remoteProfiles.clear();
 	state.remoteAttempts.clear();
-	state.watchedPeer = PeerId();
+	state.syncFailures = 0;
 	state.restoredPeers.clear();
 	state.syncStatus = state.endpoint.isEmpty()
 		? u"DISCONNECTED"_q : u"CONNECTING"_q;
@@ -1252,8 +1498,8 @@ bool SetSyncServer(not_null<Main::Session*> session, QString endpoint) {
 		state.syncStatus = u"STORAGE_ERROR"_q;
 		return false;
 	}
-	state.notify();
-	QTimer::singleShot(0, &state.network, [&state] { state.sync(); });
+	state.notify({}, Change::All);
+	state.scheduleSync(true);
 	return true;
 }
 
@@ -1444,7 +1690,7 @@ void SaveProfile(
 		state.usernames.clear();
 		state.primary.clear();
 		const auto saved = state.save();
-		state.notify();
+		state.notify(state.session->userPeerId(), Change::Profile);
 		done(saved ? QString() : u"STORAGE_ERROR"_q);
 	});
 }
@@ -1608,8 +1854,10 @@ void SendGift(
 		const auto found = state.findServerRecord(id);
 		const auto saved = found != end(state.records)
 			? std::make_optional(found->gift) : std::nullopt;
-		(void)state.save();
-		state.notify();
+		if (!state.save()) {
+			state.syncStatus = u"STORAGE_ERROR"_q;
+		}
+		state.notifyGifts();
 		state.sync();
 		done(saved, saved ? QString() : u"STORAGE_ERROR"_q);
 	});
@@ -1656,6 +1904,7 @@ void UpdateGift(
 			done(RemoveGift(session, id) ? QString() : u"STORAGE_ERROR"_q);
 		} else if (changes.contains(u"worn"_q) && found->gift.info.unique) {
 			const auto previous = state.records;
+			const auto recipient = found->recipient;
 			const auto worn = changes.value(u"worn"_q).toBool();
 			for (auto &record : state.records) {
 				if (record.recipient == found->recipient && (worn || record.gift.manageId == id)) {
@@ -1665,11 +1914,11 @@ void UpdateGift(
 					}
 				}
 			}
-			const auto saved = state.save();
+			const auto saved = state.save(true);
 			if (!saved) {
 				state.records = previous;
 			}
-			state.notify();
+			state.notify(recipient, Change::Gifts);
 			done(saved ? QString() : u"STORAGE_ERROR"_q);
 		} else {
 			done(u"SERVER_REQUIRED"_q);
@@ -1752,24 +2001,6 @@ void BuyGift(
 	});
 }
 
-bool SetProfile(
-		not_null<Main::Session*> session,
-		QString phone,
-		QStringList usernames) {
-	auto &state = Get(session);
-	const auto previousPhone = state.phone;
-	const auto previousUsernames = state.usernames;
-	state.phone = std::move(phone);
-	state.usernames = std::move(usernames);
-	if (!state.save()) {
-		state.phone = previousPhone;
-		state.usernames = previousUsernames;
-		return false;
-	}
-	state.notify();
-	return true;
-}
-
 std::vector<Data::SavedStarGift> Gifts(
 		not_null<PeerData*> peer,
 		bool pinnedOnly) {
@@ -1781,25 +2012,6 @@ std::vector<Data::SavedStarGift> Gifts(
 	state.loadRecords();
 	if (!peer->isSelf() && !state.endpoint.isEmpty()) {
 		state.view(peer);
-		const auto found = state.remoteProfiles.find(peer->id);
-		if (found != end(state.remoteProfiles)) {
-			const auto values = found->second.value(u"gifts"_q).toArray();
-			auto visible = base::flat_set<QString>();
-			for (const auto &value : values) {
-				visible.emplace(value.toObject().value(u"id"_q).toString());
-			}
-			for (auto &record : state.records) {
-				if (!record.serverId.isEmpty() && record.recipient == peer->id
-					&& record.sender != state.session->userPeerId()
-					&& !visible.contains(record.serverId)) {
-					record.active = false;
-					state.wornStatusesDirty = true;
-				}
-			}
-			for (const auto &value : values) {
-				state.acceptGift(value.toObject());
-			}
-		}
 	}
 	if (state.wornStatusesDirty) {
 		state.updateWornStatuses();
@@ -1918,7 +2130,7 @@ std::optional<Data::SavedStarGift> AddGift(
 		anonymous);
 	state.records.push_back({ source, gift, recipient->id, Encode(source), price });
 	state.records.back().localOnly = localOnly;
-	if (!state.save()) {
+	if (!state.save(true)) {
 		state.records.pop_back();
 		return {};
 	}
@@ -1929,7 +2141,7 @@ std::optional<Data::SavedStarGift> AddGift(
 		state.records.back(),
 		state.session->data().history(recipient->id),
 		true);
-	state.notify();
+	state.notify(recipient->id, Change::Gifts);
 	return gift;
 }
 
@@ -1954,11 +2166,11 @@ bool SetPinned(
 	if (pinned) {
 		found->gift.hidden = false;
 	}
-	if (!state.save()) {
+	if (!state.save(true)) {
 		found->gift = previous;
 		return false;
 	}
-	state.notify();
+	state.notify(found->recipient, Change::Gifts);
 	return true;
 }
 
@@ -1979,12 +2191,12 @@ bool SetHidden(
 		found->gift.pinned = false;
 		found->worn = false;
 	}
-	if (!state.save()) {
+	if (!state.save(true)) {
 		found->gift = previous;
 		found->worn = previouslyWorn;
 		return false;
 	}
-	state.notify();
+	state.notify(found->recipient, Change::Gifts);
 	return true;
 }
 
@@ -1997,7 +2209,7 @@ bool RemoveGift(not_null<Main::Session*> session, Data::SavedStarGiftId id) {
 	const auto index = found - begin(state.records);
 	const auto record = *found;
 	state.records.erase(found);
-	if (!state.save()) {
+	if (!state.save(true)) {
 		state.records.insert(begin(state.records) + index, record);
 		return false;
 	}
@@ -2010,7 +2222,7 @@ bool RemoveGift(not_null<Main::Session*> session, Data::SavedStarGiftId id) {
 	state.serverRecordIds.erase(record.serverId);
 	state.serverVersions.erase(record.serverId);
 	state.removeMessage(record);
-	state.notify();
+	state.notify(record.recipient, Change::Gifts);
 	return true;
 }
 

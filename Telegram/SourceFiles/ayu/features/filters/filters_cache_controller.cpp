@@ -6,15 +6,19 @@
 // Copyright @Radolyn, 2026
 #include "ayu/features/filters/filters_cache_controller.h"
 
+#include "ayu/ayu_settings.h"
 #include "ayu/data/ayu_database.h"
 #include "ayu/features/filters/filters_controller.h"
+#include "data/data_changes.h"
 #include "data/data_groups.h"
 #include "data/data_peer.h"
 #include "data/data_session.h"
 #include "history/history.h"
 #include "history/history_item.h"
+#include "main/main_session.h"
 #include "rpl/event_stream.h"
 
+#include <list>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -37,8 +41,169 @@ rpl::producer<> updates() {
 
 std::shared_ptr<const Cache> cache;
 
-std::unordered_map<long long, std::unordered_map<int64, bool>> filteredMessages;
-std::unordered_set<BareId> dialogsWithHiddenBlockedMessages; // purely for show / hide filtered messages
+namespace {
+
+constexpr auto kMaxResultsPerSession = 8192;
+
+using ResultId = std::pair<BareId, int64>;
+using ResultOrder = std::list<ResultId>;
+
+struct Result {
+	ResultOrder::iterator position;
+	bool filtered = false;
+	bool blocked = false;
+};
+
+struct DialogResults {
+	std::unordered_map<int64, Result> messages;
+	int filteredCount = 0;
+};
+
+struct SessionResults {
+	std::unordered_map<BareId, DialogResults> dialogs;
+	ResultOrder order;
+};
+
+std::unordered_map<Main::Session*, SessionResults> filteredMessages;
+std::unordered_set<Main::Session*> trackedSessions;
+
+void EraseResult(SessionResults &session, BareId peer, int64 id) {
+	const auto dialog = session.dialogs.find(peer);
+	if (dialog == session.dialogs.end()) {
+		return;
+	}
+	const auto entry = dialog->second.messages.find(id);
+	if (entry == dialog->second.messages.end()) {
+		return;
+	}
+	if (entry->second.filtered) {
+		--dialog->second.filteredCount;
+	}
+	session.order.erase(entry->second.position);
+	dialog->second.messages.erase(entry);
+	if (dialog->second.messages.empty()) {
+		session.dialogs.erase(dialog);
+	}
+}
+
+void EraseHistory(not_null<Main::Session*> session, BareId peer) {
+	std::lock_guard lock(filteredMessagesMutex);
+	const auto account = filteredMessages.find(session);
+	if (account == filteredMessages.end()) {
+		return;
+	}
+	const auto dialog = account->second.dialogs.find(peer);
+	if (dialog == account->second.dialogs.end()) {
+		return;
+	}
+	for (const auto &[id, result] : dialog->second.messages) {
+		account->second.order.erase(result.position);
+	}
+	account->second.dialogs.erase(dialog);
+}
+
+void ClearResults(not_null<Main::Session*> session) {
+	std::lock_guard lock(filteredMessagesMutex);
+	filteredMessages.erase(session);
+}
+
+void TrackSession(not_null<Main::Session*> session) {
+	{
+		std::lock_guard lock(filteredMessagesMutex);
+		if (!trackedSessions.insert(session).second) {
+			return;
+		}
+	}
+	session->data().itemRemoved(
+	) | rpl::start_with_next([](not_null<const HistoryItem*> item) {
+		invalidate(item);
+	}, session->lifetime());
+	session->data().itemIdChanged(
+	) | rpl::start_with_next([=](const Data::Session::IdChange &change) {
+		std::lock_guard lock(filteredMessagesMutex);
+		const auto account = filteredMessages.find(session);
+		if (account != filteredMessages.end()) {
+			EraseResult(account->second, change.newId.peer.value, change.oldId.bare);
+			EraseResult(account->second, change.newId.peer.value, change.newId.msg.bare);
+		}
+	}, session->lifetime());
+	session->data().itemDataChanges(
+	) | rpl::start_with_next([](not_null<HistoryItem*> item) {
+		invalidate(item);
+	}, session->lifetime());
+	session->data().historyUnloaded(
+	) | rpl::start_with_next([=](not_null<const History*> history) {
+		EraseHistory(session, history->peer->id.value);
+	}, session->lifetime());
+	session->data().historyCleared(
+	) | rpl::start_with_next([=](not_null<const History*> history) {
+		EraseHistory(session, history->peer->id.value);
+	}, session->lifetime());
+	session->data().sessionDataAboutToBeCleared(
+	) | rpl::start_with_next([=] {
+		ClearResults(session);
+	}, session->lifetime());
+	session->changes().peerUpdates(
+		Data::PeerUpdate::Flag::IsBlocked
+	) | rpl::start_with_next([=] {
+		ClearResults(session);
+	}, session->lifetime());
+	const auto &settings = AyuSettings::getInstance();
+	settings.filtersEnabledChanges(
+	) | rpl::start_with_next([=] {
+		ClearResults(session);
+	}, session->lifetime());
+	settings.hideFromBlockedChanges(
+	) | rpl::start_with_next([=] {
+		ClearResults(session);
+	}, session->lifetime());
+	settings.filtersEnabledInChatsChanges(
+	) | rpl::start_with_next([=] {
+		ClearResults(session);
+	}, session->lifetime());
+	session->lifetime().add([session] {
+		std::lock_guard lock(filteredMessagesMutex);
+		filteredMessages.erase(session);
+		trackedSessions.erase(session);
+	});
+}
+
+void PutResult(not_null<HistoryItem*> item, bool filtered, bool blocked) {
+	auto &session = filteredMessages[&item->history()->session()];
+	const auto peer = item->history()->peer->id.value;
+	const auto id = item->id.bare;
+	const auto existing = session.dialogs.find(peer);
+	if (existing != session.dialogs.end()) {
+		const auto entry = existing->second.messages.find(id);
+		if (entry != existing->second.messages.end()) {
+			existing->second.filteredCount += int(filtered)
+				- int(entry->second.filtered);
+			entry->second.filtered = filtered;
+			entry->second.blocked = blocked;
+			session.order.splice(
+				session.order.end(),
+				session.order,
+				entry->second.position);
+			return;
+		}
+	}
+	while (session.order.size() >= kMaxResultsPerSession) {
+		const auto oldest = session.order.front();
+		EraseResult(session, oldest.first, oldest.second);
+	}
+	session.order.emplace_back(peer, id);
+	auto &dialog = session.dialogs[peer];
+	dialog.messages.emplace(id, Result{
+		.position = std::prev(session.order.end()),
+		.filtered = filtered,
+		.blocked = blocked,
+	});
+	if (filtered) {
+		++dialog.filteredCount;
+	}
+}
+
+} // namespace
 
 std::shared_ptr<const Cache> buildCache() {
 	const auto filters = AyuDatabase::getAllRegexFilters();
@@ -58,7 +223,8 @@ std::shared_ptr<const Cache> buildCache() {
 		auto status = U_ZERO_ERROR;
 		auto pattern = icu::RegexPattern::compile(icu::UnicodeString::fromUTF8(filter.text), flags, status);
 
-		if (!pattern) {
+		if (U_FAILURE(status) || !pattern) {
+			delete pattern;
 			continue;
 		}
 
@@ -95,7 +261,6 @@ void rebuildCache() {
 		std::lock_guard filteredLock(filteredMessagesMutex);
 		cache = std::move(next);
 		filteredMessages.clear();
-		dialogsWithHiddenBlockedMessages.clear();
 	}
 }
 
@@ -142,41 +307,48 @@ std::shared_ptr<const Cache> snapshot() {
 }
 
 std::optional<bool> isFiltered(not_null<HistoryItem*> item) {
+	const auto session = &item->history()->session();
+	TrackSession(session);
 	std::lock_guard lock(filteredMessagesMutex);
-	auto dialogIt = filteredMessages.find(item->history()->peer->id.value);
-
-	if (dialogIt == filteredMessages.end()) {
+	const auto account = filteredMessages.find(session);
+	if (account == filteredMessages.end()) {
 		return std::nullopt;
 	}
-
-	const auto it = dialogIt->second.find(item->id.bare);
-	if (it == dialogIt->second.end()) {
+	const auto peer = item->history()->peer->id.value;
+	const auto dialog = account->second.dialogs.find(peer);
+	if (dialog == account->second.dialogs.end()) {
 		return std::nullopt;
 	}
-
-	return it->second;
+	const auto entry = dialog->second.messages.find(item->id.bare);
+	if (entry == dialog->second.messages.end()) {
+		return std::nullopt;
+	}
+	if (entry->second.blocked) {
+		EraseResult(account->second, peer, item->id.bare);
+		return std::nullopt;
+	}
+	account->second.order.splice(
+		account->second.order.end(),
+		account->second.order,
+		entry->second.position);
+	return entry->second.filtered;
 }
 
 bool hasFilteredMessages(not_null<PeerData*> peer) {
 	std::lock_guard lock(filteredMessagesMutex);
-	if (dialogsWithHiddenBlockedMessages.contains(peer->id.value)) {
-		return true;
-	}
-	const auto dialogIt = filteredMessages.find(peer->id.value);
-	if (dialogIt == filteredMessages.end()) {
+	const auto account = filteredMessages.find(&peer->session());
+	if (account == filteredMessages.end()) {
 		return false;
 	}
-	for (const auto &entry : dialogIt->second) {
-		if (entry.second) {
-			return true;
-		}
-	}
-	return false;
+	const auto dialog = account->second.dialogs.find(peer->id.value);
+	return (dialog != account->second.dialogs.end())
+		&& (dialog->second.filteredCount > 0);
 }
 
 void putHiddenBlockedMessage(not_null<HistoryItem*> item) {
+	TrackSession(&item->history()->session());
 	std::lock_guard lock(filteredMessagesMutex);
-	dialogsWithHiddenBlockedMessages.insert(item->history()->peer->id.value);
+	PutResult(item, true, true);
 }
 
 void putFiltered(
@@ -184,43 +356,39 @@ void putFiltered(
 		const Data::Group *group,
 		bool res,
 		const std::shared_ptr<const Cache> &matchedCache) {
+	TrackSession(&item->history()->session());
 	std::lock_guard cacheLock(cacheMutex);
 	if (cache != matchedCache) {
 		return;
 	}
 
 	std::lock_guard filteredLock(filteredMessagesMutex);
-	filteredMessages[item->history()->peer->id.value][item->id.bare] = res;
+	PutResult(item, res, false);
 	if (group && res) {
-		for (const auto& groupItem : group->items) {
-			filteredMessages[item->history()->peer->id.value][groupItem->id.bare] = true;
+		for (const auto &groupItem : group->items) {
+			PutResult(groupItem, true, false);
 		}
 	}
 }
 
-void invalidateSingle(not_null<HistoryItem*> item) {
-	const auto dialogIt = filteredMessages.find(item->history()->peer->id.value);
-
-	if (dialogIt == filteredMessages.end()) {
-		return;
-	}
-
-	const auto it = dialogIt->second.find(item->id.bare);
-	if (it == dialogIt->second.end()) {
-		return;
-	}
-
-	dialogIt->second.erase(it);
-}
-
-void invalidate(not_null<HistoryItem*> item) {
+void invalidate(not_null<const HistoryItem*> item) {
 	std::lock_guard lock(filteredMessagesMutex);
+	const auto account = filteredMessages.find(&item->history()->session());
+	if (account == filteredMessages.end()) {
+		return;
+	}
 	if (const auto group = item->history()->owner().groups().find(item)) {
-		for (const auto& groupItem : group->items) {
-			invalidateSingle(groupItem);
+		for (const auto &groupItem : group->items) {
+			EraseResult(
+				account->second,
+				groupItem->history()->peer->id.value,
+				groupItem->id.bare);
 		}
 	} else {
-		invalidateSingle(item);
+		EraseResult(
+			account->second,
+			item->history()->peer->id.value,
+			item->id.bare);
 	}
 }
 

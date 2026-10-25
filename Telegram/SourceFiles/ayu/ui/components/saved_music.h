@@ -8,6 +8,8 @@
 
 #include "ui/widgets/buttons.h"
 
+#include <atomic>
+
 namespace Ui {
 class FlatLabel;
 } // namespace Ui
@@ -20,20 +22,25 @@ namespace Info::Profile {
 
 struct MusicButtonData;
 
-struct ResultCover
-{
+struct ResultCover {
 	QPixmap pix;
 	QColor bg;
-	bool noCover;
+	bool noCover = true;
 };
 
-class AyuMusicButton final : public Ui::RippleButton
-{
+class AyuMusicButton final : public Ui::RippleButton {
 public:
-	AyuMusicButton(QWidget *parent, MusicButtonData data, std::optional<QColor> overrideBg, Fn<void()> handler);
+	AyuMusicButton(
+		QWidget *parent,
+		MusicButtonData data,
+		std::optional<QColor> overrideBg,
+		Fn<void()> handler);
 	~AyuMusicButton();
 
 	void updateData(MusicButtonData data);
+	void setOverrideBg(std::optional<QColor> color);
+	void setCoverActive(bool active);
+	void refreshColors();
 
 	rpl::producer<> onReady() const {
 		return _onReady.events();
@@ -42,6 +49,9 @@ public:
 private:
 	void downloadAndMakeCover(FullMsgId msgId);
 	void makeCover();
+	void prepareCover(QImage image);
+	void applyCover(QImage image, std::optional<QRgb> color);
+	void cancelCover();
 
 	void paintEvent(QPaintEvent *e) override;
 	int resizeGetHeight(int newWidth) override;
@@ -51,6 +61,13 @@ private:
 	std::shared_ptr<Data::DocumentMedia> _mediaView;
 	std::optional<ResultCover> _currentCover;
 	rpl::event_stream<> _onReady;
+	rpl::lifetime _coverLifetime;
+	rpl::lifetime _downloadLifetime;
+	std::shared_ptr<std::atomic_bool> _coverCancelled;
+	std::optional<QColor> _adaptiveColor;
+	FullMsgId _msgId;
+	uint64 _coverGeneration = 0;
+	bool _coverActive = false;
 
 	QString _performerText;
 	QString _titleText;

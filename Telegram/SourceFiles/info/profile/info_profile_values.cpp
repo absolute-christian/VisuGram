@@ -58,7 +58,7 @@ auto PlainUsernameValue(not_null<PeerData*> peer) {
 	return rpl::merge(
 		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username) | rpl::to_empty,
 		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames) | rpl::to_empty,
-		Ayu::Visual::Changes(&peer->session())
+		Ayu::Visual::PeerChanges(peer, Ayu::Visual::Change::Profile)
 	) | rpl::map([=] {
 		const auto names = Ayu::Visual::DisplayUsernames(peer);
 		return (!names.empty())
@@ -136,7 +136,7 @@ rpl::producer<TextWithEntities> PhoneValue(not_null<UserData*> user) {
 		user->session().changes().peerFlagsValue(
 			user,
 			UpdateFlag::PhoneNumber) | rpl::to_empty,
-		Ayu::Visual::Changes(&user->session())
+		Ayu::Visual::PeerChanges(user, Ayu::Visual::Change::Profile)
 	) | rpl::map([=] {
 		const auto visual = Ayu::Visual::PhoneFor(user);
 		return tr::marked((!visual.isEmpty())
@@ -238,7 +238,7 @@ rpl::producer<std::vector<TextWithEntities>> UsernamesValue(
 	auto value = rpl::merge(
 		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Username) | rpl::to_empty,
 		peer->session().changes().peerFlagsValue(peer, UpdateFlag::Usernames) | rpl::to_empty,
-		Ayu::Visual::Changes(&peer->session())
+		Ayu::Visual::PeerChanges(peer, Ayu::Visual::Change::Profile)
 	);
 	if (const auto user = peer->asUser()) {
 		return std::move(value) | rpl::map([=] {
@@ -685,7 +685,7 @@ rpl::producer<int> PeerGiftsCountValue(not_null<PeerData*> peer) {
 		peer->session().changes().peerFlagsValue(
 			peer,
 			UpdateFlag::PeerGifts) | rpl::to_empty,
-		Ayu::Visual::Changes(&peer->session())
+		Ayu::Visual::PeerChanges(peer, Ayu::Visual::Change::Gifts)
 	) | rpl::map([=] {
 		return peer->peerGiftsCount() + Ayu::Visual::GiftCount(peer);
 	});

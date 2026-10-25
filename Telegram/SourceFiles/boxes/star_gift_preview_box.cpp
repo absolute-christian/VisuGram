@@ -1412,8 +1412,7 @@ void StarGiftPreviewBox(
 		})
 		, attributes(attributes)
 		, tab(tab)
-		, gift(make())
-		, pushNextTimer([=] { push(); }) {
+		, gift(make()) {
 			apply(selected);
 		}
 		void apply(std::shared_ptr<Data::UniqueGift> selected) {
@@ -1496,6 +1495,7 @@ void StarGiftPreviewBox(
 		AttributesList *list = nullptr;
 
 		base::Timer pushNextTimer;
+		bool closing = false;
 	};
 
 	const auto state = box->lifetime().make_state<State>(
@@ -1592,12 +1592,36 @@ void StarGiftPreviewBox(
 		st::uniqueAttributeModelActive,
 		Tab::Model);
 
-	state->paused.value() | rpl::on_next([=](bool paused) {
-		if (paused) {
+	const auto refreshTimer = [=] {
+		const auto active = !state->closing
+			&& !state->paused.current()
+			&& box->isVisible()
+			&& box->window()->isActiveWindow()
+			&& !box->window()->isMinimized();
+		if (!active) {
 			state->pushNextTimer.cancel();
-		} else {
+		} else if (!state->pushNextTimer.isActive()) {
 			state->pushNextTimer.callEach(kSwitchTimeout);
 		}
+	};
+	state->pushNextTimer.setCallback([=] {
+		refreshTimer();
+		if (state->pushNextTimer.isActive()) {
+			state->push();
+		}
+	});
+	rpl::merge(
+		state->paused.value() | rpl::to_empty,
+		box->windowActiveValue() | rpl::to_empty,
+		box->showFinishes(),
+		box->events() | rpl::filter([](not_null<QEvent*> event) {
+			return event->type() == QEvent::Show
+				|| event->type() == QEvent::Hide;
+		}) | rpl::to_empty
+	) | rpl::on_next(refreshTimer, box->lifetime());
+	box->boxClosing() | rpl::on_next([=] {
+		state->closing = true;
+		state->pushNextTimer.cancel();
 	}, box->lifetime());
 }
 

@@ -222,6 +222,7 @@ private:
 	void markInCollection(const Data::SavedStarGift &gift);
 	void refreshButtons();
 	void refreshLocalGifts();
+	void refreshVisualGifts();
 	void validateButtons();
 	[[nodiscard]] std::unique_ptr<GiftButton> createGiftButton();
 	void showGift(int index);
@@ -298,6 +299,8 @@ private:
 	int _perRow = 0;
 	int _visibleFrom = 0;
 	int _visibleTill = 0;
+	rpl::variable<bool> _visualVisible = false;
+	bool _visualGiftsDirty = true;
 
 	DragState _dragging;
 	base::flat_map<int, ShiftAnimation> _shiftAnimations;
@@ -364,16 +367,29 @@ InnerWidget::InnerWidget(
 	_singleMin = _delegate.buttonSize();
 	base::install_event_filter(this, [=](not_null<QEvent*> event) {
 		if (event->type() == QEvent::Hide || event->type() == QEvent::Show) {
-			Ui::PostponeCall(this, [=] { validateButtons(); });
+			Ui::PostponeCall(this, [=] {
+				_visualVisible = isVisible()
+					&& !_window->isGifPausedAtLeastFor(Window::GifPauseReason::Any);
+				refreshVisualGifts();
+				validateButtons();
+			});
 		}
 		return base::EventFilterResult::Continue;
 	}, lifetime());
-	Ayu::Visual::Changes(&_peer->session()) | rpl::on_next([=] {
-		refreshLocalGifts();
-		refreshButtons();
-		refreshAbout();
+	Ayu::Visual::PeerChanges(_peer, Ayu::Visual::Change::Gifts)
+	| rpl::on_next([=] {
+		_visualGiftsDirty = true;
+		refreshVisualGifts();
 	}, lifetime());
-	refreshLocalGifts();
+	rpl::merge(
+		windowActiveValue() | rpl::to_empty,
+		_window->gifPauseLevelChanged()
+	) | rpl::on_next([=] {
+		_visualVisible = isVisible()
+			&& !_window->isGifPausedAtLeastFor(Window::GifPauseReason::Any);
+		refreshVisualGifts();
+	}, lifetime());
+	Ayu::Visual::ObservePeer(_peer, _visualVisible.value(), lifetime());
 
 	if (peer->canManageGifts()) {
 		subscribeToUpdates();
@@ -766,6 +782,16 @@ void InnerWidget::loaded(const MTPpayments_SavedStarGifts &result) {
 	if (hasUnique) {
 		Ui::PreloadUniqueGiftResellPrices(&_peer->session());
 	}
+}
+
+void InnerWidget::refreshVisualGifts() {
+	if (!_visualGiftsDirty || !_visualVisible.current()) {
+		return;
+	}
+	_visualGiftsDirty = false;
+	refreshLocalGifts();
+	refreshButtons();
+	refreshAbout();
 }
 
 void InnerWidget::refreshLocalGifts() {

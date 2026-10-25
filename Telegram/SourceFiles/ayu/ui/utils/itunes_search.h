@@ -6,13 +6,16 @@
 // Copyright @Radolyn, 2026
 #pragma once
 
-#include <QtGui/QPixmap>
+#include <rpl/producer.h>
+
+#include <QtGui/QImage>
 
 namespace Ayu::Ui::Itunes {
 
-QPixmap FetchCover(const QString &performer,
-                   const QString &title,
-                   int sizeHintPx = 300,
-                   int timeoutMs = 5000);
+[[nodiscard]] rpl::producer<QImage> FetchCover(
+	const QString &performer,
+	const QString &title,
+	int sizeHintPx = 300,
+	int timeoutMs = 5000);
 
-}
+} // namespace Ayu::Ui::Itunes

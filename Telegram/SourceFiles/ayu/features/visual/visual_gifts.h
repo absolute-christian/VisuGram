@@ -21,6 +21,12 @@ class VerticalLayout;
 
 namespace Ayu::Visual {
 
+enum class Change {
+	Profile,
+	Gifts,
+	All,
+};
+
 [[nodiscard]] QString Text(QString english, QString russian);
 [[nodiscard]] rpl::producer<QString> TextValue(
 	QString english,
@@ -31,7 +37,13 @@ namespace Ayu::Visual {
 	const MTPInputInvoice &invoice);
 [[nodiscard]] rpl::producer<bool> EnabledValue(
 	not_null<Main::Session*> session);
-[[nodiscard]] rpl::producer<> Changes(not_null<Main::Session*> session);
+[[nodiscard]] rpl::producer<> PeerChanges(
+	not_null<PeerData*> peer,
+	Change change);
+void ObservePeer(
+	not_null<PeerData*> peer,
+	rpl::producer<bool> visible,
+	rpl::lifetime &lifetime);
 [[nodiscard]] bool SetEnabled(not_null<Main::Session*> session, bool enabled);
 [[nodiscard]] QString Phone(not_null<Main::Session*> session);
 [[nodiscard]] QStringList Usernames(not_null<Main::Session*> session);
@@ -73,10 +85,6 @@ void BuyGift(not_null<Main::Session*> session, Data::SavedStarGiftId id,
 void ShowCollectible(not_null<Window::SessionController*> window,
 	not_null<PeerData*> peer, QString entity);
 void ShowSyncSettings(not_null<Window::SessionController*> window);
-[[nodiscard]] bool SetProfile(
-	not_null<Main::Session*> session,
-	QString phone,
-	QStringList usernames);
 [[nodiscard]] std::vector<Data::SavedStarGift> Gifts(
 	not_null<PeerData*> peer,
 	bool pinnedOnly = false);

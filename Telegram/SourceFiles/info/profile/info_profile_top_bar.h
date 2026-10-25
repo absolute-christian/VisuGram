@@ -153,6 +153,8 @@ protected:
 	void paintEvent(QPaintEvent *e) override;
 
 private:
+	struct PinnedToTopGiftEntry;
+
 	[[nodiscard]] bool clipTouchesRoundedCorners(const QRect &clip) const;
 	void paintEdges(
 		QPainter &p,
@@ -198,6 +200,13 @@ private:
 	void setupNewGifts(
 		not_null<Window::SessionController*> controller,
 		const std::vector<Data::SavedStarGift> &gifts);
+	[[nodiscard]] bool pinnedGiftsActive() const;
+	void updatePinnedGiftPlayback();
+	[[nodiscard]] float64 pinnedGiftProgress() const;
+	[[nodiscard]] QRectF pinnedGiftGeometry(
+		const PinnedToTopGiftEntry &gift,
+		float64 progress,
+		const QRect &userpicRect) const;
 	void paintPinnedToTopGifts(
 		QPainter &p,
 		const QRect &clip,
@@ -376,6 +385,7 @@ private:
 		base::unique_qptr<Ui::AbstractButton> button;
 	};
 	bool _pinnedToTopGiftsFirstTimeShowed = false;
+	bool _pinnedToTopGiftsPending = false;
 	std::vector<PinnedToTopGiftEntry> _pinnedToTopGifts;
 	std::unique_ptr<Ui::Animations::Simple> _giftsAppearing;
 	std::unique_ptr<Ui::Animations::Simple> _giftsHiding;

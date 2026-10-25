@@ -579,53 +579,91 @@ TopBar::TopBar(
 	}
 	rpl::merge(
 		windowActiveValue() | rpl::to_empty,
-		descriptor.controller->gifPauseLevelChanged()
+		descriptor.controller->gifPauseLevelChanged(),
+		events() | rpl::filter([](not_null<QEvent*> event) {
+			return event->type() == QEvent::Show
+				|| event->type() == QEvent::Hide;
+		}) | rpl::to_empty
 	) | rpl::on_next([=] {
+		if (_pinnedToTopGiftsPending && pinnedGiftsActive()) {
+			setupPinnedToTopGifts(controller);
+		}
+		updatePinnedGiftPlayback();
 		update();
 	}, lifetime());
 
-	Ayu::Visual::Changes(&_peer->session()) | rpl::on_next([=] {
-		setupPinnedToTopGifts(controller);
-	}, lifetime());
+	if (_source != Source::Preview) {
+		Ayu::Visual::ObservePeer(
+			_peer,
+			rpl::merge(
+				windowActiveValue() | rpl::to_empty,
+				descriptor.controller->gifPauseLevelChanged(),
+				events() | rpl::filter([](not_null<QEvent*> event) {
+					return event->type() == QEvent::Show
+						|| event->type() == QEvent::Hide;
+				}) | rpl::to_empty
+			) | rpl::map([=] {
+				return pinnedGiftsActive();
+			}) | rpl::distinct_until_changed(),
+			lifetime());
+		Ayu::Visual::PeerChanges(
+			_peer,
+			Ayu::Visual::Change::Gifts
+		) | rpl::on_next([=] {
+			setupPinnedToTopGifts(controller);
+		}, lifetime());
 
-	rpl::merge(
-		style::PaletteChanged(),
-		_peer->session().data().giftUpdates() | rpl::filter([=](
-				const Data::GiftUpdate &update) {
-			if (update.action == Data::GiftUpdate::Action::Pin) {
-				if (_peer->isSelf() && update.id.isUser()) {
-					return true;
-				}
-				if (_peer == update.id.chat()) {
-					return true;
-				}
-			}
-			if (update.action == Data::GiftUpdate::Action::Unpin) {
-				for (const auto &gift : _pinnedToTopGifts) {
-					if (gift.manageId == update.id) {
+		rpl::merge(
+			style::PaletteChanged(),
+			_peer->session().data().giftUpdates() | rpl::filter([=](
+					const Data::GiftUpdate &update) {
+				if (update.action == Data::GiftUpdate::Action::Pin) {
+					if (_peer->isSelf() && update.id.isUser()) {
+						return true;
+					}
+					if (_peer == update.id.chat()) {
 						return true;
 					}
 				}
+				if (update.action == Data::GiftUpdate::Action::Unpin) {
+					for (const auto &gift : _pinnedToTopGifts) {
+						if (gift.manageId == update.id) {
+							return true;
+						}
+					}
+				}
+				return false;
+			}) | rpl::to_empty,
+			_peer->session().changes().peerFlagsValue(
+				_peer,
+				Data::PeerUpdate::Flag::EmojiStatus
+					| Data::PeerUpdate::Flag::ColorProfile) | rpl::to_empty
+		) | rpl::on_next([=] {
+			if (_pinnedToTopGiftsFirstTimeShowed) {
+				_peer->session().recentSharedGifts().clearLastRequestTime(_peer);
+				setupPinnedToTopGifts(controller);
+			} else {
+				updateCollectibleStatus();
 			}
-			return false;
-		}) | rpl::to_empty,
-		_peer->session().changes().peerFlagsValue(
-			_peer,
-			Data::PeerUpdate::Flag::EmojiStatus
-				| Data::PeerUpdate::Flag::ColorProfile) | rpl::to_empty
-	) | rpl::on_next([=] {
-		if (_pinnedToTopGiftsFirstTimeShowed) {
-			_peer->session().recentSharedGifts().clearLastRequestTime(_peer);
-			setupPinnedToTopGifts(controller);
-		} else {
+		}, lifetime());
+	} else {
+		rpl::merge(
+			style::PaletteChanged(),
+			_peer->session().changes().peerFlagsValue(
+				_peer,
+				Data::PeerUpdate::Flag::EmojiStatus
+					| Data::PeerUpdate::Flag::ColorProfile) | rpl::to_empty
+		) | rpl::on_next([=] {
 			updateCollectibleStatus();
-		}
-	}, lifetime());
+		}, lifetime());
+	}
 
 	std::move(
 		descriptor.showFinished
 	) | rpl::take(1) | rpl::on_next([=] {
-		setupPinnedToTopGifts(controller);
+		if (_source != Source::Preview) {
+			setupPinnedToTopGifts(controller);
+		}
 		setupBirthdayEffect();
 	}, lifetime());
 
@@ -815,6 +853,8 @@ void TopBar::updateCollectibleStatus() {
 	} else {
 		_animatedPoints.clear();
 		_pinnedToTopGifts.clear();
+		_giftsLoadingLifetime.destroy();
+		_lottiePlayer = nullptr;
 	}
 	const auto verifiedFg = [&]() -> std::optional<QColor> {
 		if (collectible) {
@@ -2811,6 +2851,7 @@ void TopBar::updateGiftButtonsGeometry(
 			gift.button->setGeometry(buttonRect);
 		}
 	}
+	updatePinnedGiftPlayback();
 }
 
 void TopBar::paintUserpic(QPainter &p, const QRect &geometry) {
@@ -2988,10 +3029,7 @@ void TopBar::paintEvent(QPaintEvent *e) {
 		paintAnimatedPattern(p, clipBounds, geometry);
 	}
 
-	if (clipBounds.bottom() >= geometry.top()
-		&& clipBounds.top() <= geometry.bottom()) {
-		paintPinnedToTopGifts(p, clipBounds, geometry);
-	}
+	paintPinnedToTopGifts(p, clipBounds, geometry);
 
 	if (clipBounds.intersects(geometry)) {
 		paintUserpic(p, geometry);
@@ -3480,8 +3518,19 @@ void TopBar::paintAnimatedPattern(
 
 void TopBar::setupPinnedToTopGifts(
 		not_null<Window::SessionController*> controller) {
+	Expects(_source != Source::Preview);
+
+	if (!pinnedGiftsActive()) {
+		_pinnedToTopGiftsPending = true;
+		return;
+	}
+	_pinnedToTopGiftsPending = false;
 	const auto requestDone = crl::guard(this, [=](
 			std::vector<Data::SavedStarGift> gifts) {
+		if (!pinnedGiftsActive()) {
+			_pinnedToTopGiftsPending = true;
+			return;
+		}
 		const auto shouldHideFirst = _pinnedToTopGiftsFirstTimeShowed
 			&& !_pinnedToTopGifts.empty();
 
@@ -3493,6 +3542,7 @@ void TopBar::setupPinnedToTopGifts(
 					_giftsHiding = nullptr;
 					_pinnedToTopGifts.clear();
 					_giftsLoadingLifetime.destroy();
+					_lottiePlayer = nullptr;
 					updateCollectibleStatus();
 					setupNewGifts(controller, gifts);
 				}
@@ -3502,6 +3552,7 @@ void TopBar::setupPinnedToTopGifts(
 
 		_pinnedToTopGifts.clear();
 		_giftsLoadingLifetime.destroy();
+		_lottiePlayer = nullptr;
 
 		updateCollectibleStatus();
 		setupNewGifts(controller, gifts);
@@ -3512,6 +3563,10 @@ void TopBar::setupPinnedToTopGifts(
 void TopBar::setupNewGifts(
 		not_null<Window::SessionController*> controller,
 		const std::vector<Data::SavedStarGift> &gifts) {
+	if (!pinnedGiftsActive()) {
+		_pinnedToTopGiftsPending = true;
+		return;
+	}
 	const auto emojiStatusId = _peer->emojiStatusId().collectible
 		? _peer->emojiStatusId().collectible->id
 		: CollectibleId(0);
@@ -3605,6 +3660,10 @@ void TopBar::setupNewGifts(
 	) | rpl::then(
 		_peer->session().downloaderTaskFinished()
 	) | rpl::on_next([=] {
+		if (!pinnedGiftsActive()) {
+			_pinnedToTopGiftsPending = true;
+			return;
+		}
 		auto allLoaded = true;
 		for (auto &entry : _pinnedToTopGifts) {
 			if (!entry.animation && !entry.lastFrame.isNull()) {
@@ -3621,6 +3680,7 @@ void TopBar::setupNewGifts(
 				allLoaded = false;
 			}
 		}
+		updatePinnedGiftPlayback();
 		if (allLoaded) {
 			_giftsLoadingLifetime.destroy();
 			_giftsAppearing->stop();
@@ -3716,51 +3776,102 @@ QPointF TopBar::calculateGiftPosition(
 	return giftPos;
 }
 
-void TopBar::paintPinnedToTopGifts(
-		QPainter &p,
-		const QRect &clip,
-		const QRect &userpicRect) {
-	if (_pinnedToTopGifts.empty() || _source == Source::Preview) {
-		return;
-	}
-
-	const auto progress = _giftsHiding
+float64 TopBar::pinnedGiftProgress() const {
+	return _giftsHiding
 		? _progress.current() * _giftsHiding->value(1.)
 		: (_giftsAppearing
 			? _progress.current() * _giftsAppearing->value(0.)
 			: _progress.current());
+}
 
-	for (auto &gift : _pinnedToTopGifts) {
-		if (!gift.animation
-			&& (_lottieSingleLoop ? gift.lastFrame.isNull() : true)) {
+QRectF TopBar::pinnedGiftGeometry(
+		const PinnedToTopGiftEntry &gift,
+		float64 progress,
+		const QRect &userpicRect) const {
+	const auto position = calculateGiftPosition(
+		gift.position,
+		progress,
+		userpicRect);
+	const auto size = std::max(
+		st::infoProfileTopBarGiftSize,
+		gift.bg.isNull() ? 0 : gift.bg.width() / style::DevicePixelRatio());
+	return QRectF(
+		position.x() - size / 2.,
+		position.y() - size / 2.,
+		size,
+		size);
+}
+
+bool TopBar::pinnedGiftsActive() const {
+	return _source != Source::Preview
+		&& isVisible()
+		&& window()->isActiveWindow()
+		&& !window()->isMinimized()
+		&& !_gifPausedChecker();
+}
+
+void TopBar::updatePinnedGiftPlayback() {
+	if (!_lottiePlayer) {
+		return;
+	}
+	const auto progress = pinnedGiftProgress();
+	const auto active = pinnedGiftsActive() && progress > 0.;
+	const auto visible = active ? visibleRegion() : QRegion();
+	const auto geometry = userpicGeometry();
+	for (const auto &gift : _pinnedToTopGifts) {
+		if (!gift.animation) {
 			continue;
 		}
+		if (visible.intersects(
+				pinnedGiftGeometry(gift, progress, geometry).toAlignedRect())) {
+			_lottiePlayer->unpause(gift.animation);
+		} else {
+			_lottiePlayer->pause(gift.animation);
+		}
+	}
+}
 
+void TopBar::paintPinnedToTopGifts(
+		QPainter &p,
+		const QRect &clip,
+		const QRect &userpicRect) {
+	if (_pinnedToTopGifts.empty()) {
+		return;
+	}
+
+	updatePinnedGiftPlayback();
+	const auto progress = pinnedGiftProgress();
+	if (progress <= 0.) {
+		return;
+	}
+	const auto paused = !pinnedGiftsActive();
+	auto frameShown = false;
+	for (auto &gift : _pinnedToTopGifts) {
+		if ((!gift.animation && gift.lastFrame.isNull())
+			|| !pinnedGiftGeometry(gift, progress, userpicRect).intersects(clip)) {
+			continue;
+		}
 		const auto giftPos = calculateGiftPosition(
 			gift.position,
 			progress,
 			userpicRect);
 
-		const auto alpha = progress;
-		if (alpha <= 0.) {
-			continue;
-		}
-
-		p.setOpacity(alpha);
+		p.setOpacity(progress);
 		auto frameToRender = QImage();
 		if (_lottieSingleLoop && !gift.lastFrame.isNull()) {
 			frameToRender = gift.lastFrame;
 		} else if (gift.animation && gift.animation->ready()) {
 			frameToRender = gift.animation->frame();
 			frameToRender.setDevicePixelRatio(style::DevicePixelRatio());
-			if (_lottiePlayer) {
-				_lottiePlayer->markFrameShown();
+			if (!paused) {
+				frameShown = true;
 			}
 			if (_lottieSingleLoop && gift.animation->framesCount() > 0) {
 				const auto currentFrame = gift.animation->frameIndex();
 				const auto totalFrames = gift.animation->framesCount();
 				if (currentFrame >= totalFrames - 1) {
 					gift.lastFrame = frameToRender;
+					_lottiePlayer->remove(gift.animation);
 					gift.animation = nullptr;
 
 					auto allDone = true;
@@ -3777,31 +3888,24 @@ void TopBar::paintPinnedToTopGifts(
 			}
 		}
 		if (!frameToRender.isNull()) {
-			const auto frameSize = frameToRender.width()
+			const auto frameSize = frameToRender.size()
 				/ style::DevicePixelRatio();
-			const auto halfFrameSize = frameSize / 2.;
 			const auto resultPos = QPointF(
-				giftPos.x() - halfFrameSize,
-				giftPos.y() - halfFrameSize);
-			auto target = QRectF(resultPos, QSizeF(frameSize, frameSize));
-			auto bgPos = QPointF();
-			const auto bgSize = gift.bg.isNull()
-				? 0
-				: (gift.bg.width() / style::DevicePixelRatio());
-			if (bgSize > 0) {
-				bgPos = QPointF(
-					resultPos.x() + (frameSize - bgSize) / 2.,
-					resultPos.y() + (frameSize - bgSize) / 2.);
-				target = target.united(
-					QRectF(bgPos, QSizeF(bgSize, bgSize)));
+				giftPos.x() - frameSize.width() / 2.,
+				giftPos.y() - frameSize.height() / 2.);
+			if (!gift.bg.isNull()) {
+				const auto bgSize = gift.bg.size() / style::DevicePixelRatio();
+				p.drawImage(
+					QPointF(
+						giftPos.x() - bgSize.width() / 2.,
+						giftPos.y() - bgSize.height() / 2.),
+					gift.bg);
 			}
-			if (target.intersects(QRectF(clip))) {
-				if (bgSize > 0) {
-					p.drawImage(bgPos, gift.bg);
-				}
-				p.drawImage(resultPos, frameToRender);
-			}
+			p.drawImage(resultPos, frameToRender);
 		}
+	}
+	if (frameShown && _lottiePlayer) {
+		_lottiePlayer->markFrameShown();
 	}
 	p.setOpacity(1.);
 }

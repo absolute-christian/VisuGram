@@ -51,6 +51,6 @@ void putFiltered(
 	bool res,
 	const std::shared_ptr<const Cache> &matchedCache);
 
-void invalidate(not_null<HistoryItem*> item);
+void invalidate(not_null<const HistoryItem*> item);
 
 }

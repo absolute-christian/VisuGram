@@ -4876,9 +4876,9 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		Delegate delegate;
 		DefaultGiftHandlerState handlerState;
 		std::vector<int> order;
-		std::vector<bool> validated;
 		std::vector<GiftDescriptor> list;
 		std::vector<std::unique_ptr<GiftButton>> buttons;
+		bool invalidated = false;
 		rpl::variable<VisibleRange> visibleRange;
 		bool sending = false;
 		int perRow = 1;
@@ -4910,8 +4910,8 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 	const auto &packs = session->giftBoxStickersPacks();
 	packs.updated() | rpl::on_next([=] {
 		for (const auto &button : state->buttons) {
-			if (const auto raw = button.get()) {
-				raw->update();
+			if (button) {
+				button->update();
 			}
 		}
 	}, raw->lifetime());
@@ -4921,7 +4921,6 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 	const auto rebuild = [=] {
 		if (!raw->isVisible()) {
 			state->buttons.clear();
-			state->validated.clear();
 			state->firstVisible = -1;
 			state->lastVisible = -1;
 			return;
@@ -4931,11 +4930,6 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		const auto available = width - padding.left() - padding.right();
 		const auto range = state->visibleRange.current();
 		const auto count = int(state->list.size());
-
-		auto &buttons = state->buttons;
-		buttons.resize(count);
-		auto &validated = state->validated;
-		validated.resize(count);
 
 		auto x = padding.left();
 		auto y = padding.top();
@@ -4950,46 +4944,45 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		Assert(rowTill >= rowFrom);
 		const auto first = std::min(rowFrom * perRow, count);
 		const auto last = std::min(rowTill * perRow, count);
-		if (state->firstVisible == first && state->lastVisible == last) {
+		if (!state->invalidated
+			&& state->firstVisible == first
+			&& state->lastVisible == last) {
 			const auto page = range.bottom - range.top;
 			if (loadMore && page > 0 && range.bottom + page > raw->height()) {
 				loadMore();
 			}
 			return;
 		}
+		auto unused = std::vector<std::unique_ptr<GiftButton>>();
+		unused.reserve(state->buttons.size());
+		auto buttons = std::vector<std::unique_ptr<GiftButton>>(last - first);
+		for (auto i = 0; i != int(state->buttons.size()); ++i) {
+			const auto index = state->firstVisible + i;
+			if (index >= first && index < last) {
+				buttons[index - first] = std::move(state->buttons[i]);
+			} else {
+				unused.push_back(std::move(state->buttons[i]));
+			}
+		}
+		state->buttons = std::move(buttons);
 		state->firstVisible = first;
 		state->lastVisible = last;
-		auto checkedFrom = 0;
-		auto checkedTill = int(buttons.size());
 		const auto ensureButton = [&](int index) {
-			auto &button = buttons[index];
-			if (!button) {
-				validated[index] = false;
-				for (; checkedFrom != first; ++checkedFrom) {
-					if (buttons[checkedFrom]) {
-						button = std::move(buttons[checkedFrom]);
-						break;
-					}
+			auto &button = state->buttons[index - first];
+			const auto retained = (button != nullptr);
+			if (!retained) {
+				if (!unused.empty()) {
+					button = std::move(unused.back());
+					unused.pop_back();
+				} else {
+					button = std::make_unique<GiftButton>(raw, &state->delegate);
 				}
 			}
-			if (!button) {
-				for (; checkedTill != last; ) {
-					--checkedTill;
-					if (buttons[checkedTill]) {
-						button = std::move(buttons[checkedTill]);
-						break;
-					}
-				}
-			}
-			if (!button) {
-				button = std::make_unique<GiftButton>(raw, &state->delegate);
-			}
-			const auto raw = button.get();
-			if (validated[index]) {
+			if (retained && !state->invalidated) {
 				return;
 			}
+			const auto raw = button.get();
 			raw->show();
-			validated[index] = true;
 			const auto &descriptor = state->list[state->order[index]];
 			if (mode == GiftsListMode::Craft) {
 				const auto already = ranges::contains(
@@ -5029,12 +5022,7 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 				}
 			}
 		}
-		for (auto i = 0; i != int(buttons.size()); ++i) {
-			if (i < first || i >= last) {
-				buttons[i].reset();
-				validated[i] = false;
-			}
-		}
+		state->invalidated = false;
 
 		const auto page = range.bottom - range.top;
 		if (loadMore && page > 0 && range.bottom + page > raw->height()) {
@@ -5066,9 +5054,7 @@ object_ptr<RpWidget> MakeGiftsList(GiftsListArgs &&args) {
 		state->order = ranges::views::ints
 			| ranges::views::take(count)
 			| ranges::to_vector;
-		state->validated.clear();
-		state->firstVisible = -1;
-		state->lastVisible = -1;
+		state->invalidated = true;
 
 		if (SortForBirthday(peer)) {
 			ranges::stable_partition(state->order, [&](int i) {
