@@ -115,11 +115,11 @@ void TrackSession(not_null<Main::Session*> session) {
 		}
 	}
 	session->data().itemRemoved(
-	) | rpl::start_with_next([](not_null<const HistoryItem*> item) {
+	) | rpl::on_next([](not_null<const HistoryItem*> item) {
 		invalidate(item);
 	}, session->lifetime());
 	session->data().itemIdChanged(
-	) | rpl::start_with_next([=](const Data::Session::IdChange &change) {
+	) | rpl::on_next([=](const Data::Session::IdChange &change) {
 		std::lock_guard lock(filteredMessagesMutex);
 		const auto account = filteredMessages.find(session);
 		if (account != filteredMessages.end()) {
@@ -128,37 +128,37 @@ void TrackSession(not_null<Main::Session*> session) {
 		}
 	}, session->lifetime());
 	session->data().itemDataChanges(
-	) | rpl::start_with_next([](not_null<HistoryItem*> item) {
+	) | rpl::on_next([](not_null<HistoryItem*> item) {
 		invalidate(item);
 	}, session->lifetime());
 	session->data().historyUnloaded(
-	) | rpl::start_with_next([=](not_null<const History*> history) {
+	) | rpl::on_next([=](not_null<const History*> history) {
 		EraseHistory(session, history->peer->id.value);
 	}, session->lifetime());
 	session->data().historyCleared(
-	) | rpl::start_with_next([=](not_null<const History*> history) {
+	) | rpl::on_next([=](not_null<const History*> history) {
 		EraseHistory(session, history->peer->id.value);
 	}, session->lifetime());
 	session->data().sessionDataAboutToBeCleared(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		ClearResults(session);
 	}, session->lifetime());
 	session->changes().peerUpdates(
 		Data::PeerUpdate::Flag::IsBlocked
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		ClearResults(session);
 	}, session->lifetime());
 	const auto &settings = AyuSettings::getInstance();
 	settings.filtersEnabledChanges(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		ClearResults(session);
 	}, session->lifetime());
 	settings.hideFromBlockedChanges(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		ClearResults(session);
 	}, session->lifetime());
 	settings.filtersEnabledInChatsChanges(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		ClearResults(session);
 	}, session->lifetime());
 	session->lifetime().add([session] {

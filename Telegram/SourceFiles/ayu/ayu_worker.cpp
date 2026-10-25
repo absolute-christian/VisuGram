@@ -130,13 +130,13 @@ void TrackSession(not_null<Main::Session*> session) {
 	) | rpl::map([=] {
 		return AyuSettings::ghost(session).sendOfflinePacketAfterOnlineValue();
 	}) | rpl::flatten_latest(
-	) | rpl::start_with_next([=](bool enabled) {
+	) | rpl::on_next([=](bool enabled) {
 		Queue(session, enabled);
 	}, session->lifetime());
 	session->changes().peerUpdates(
 		session->user(),
 		Data::PeerUpdate::Flag::OnlineStatus
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		if (session->user()->lastseen().isOnline(base::unixtime::now())) {
 			Queue(session, false);
 		}
@@ -154,7 +154,7 @@ void TrackAccounts() {
 			continue;
 		}
 		account->sessionValue(
-		) | rpl::start_with_next([](Main::Session *session) {
+		) | rpl::on_next([](Main::Session *session) {
 			if (session) {
 				TrackSession(session);
 			}
@@ -174,7 +174,7 @@ void markAsOnline(not_null<Main::Session*> session) {
 
 void initialize() {
 	Core::App().domain().accountsChanges(
-	) | rpl::start_with_next(TrackAccounts, lifetime);
+	) | rpl::on_next(TrackAccounts, lifetime);
 	TrackAccounts();
 }
 
