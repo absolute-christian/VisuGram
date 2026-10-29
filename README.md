@@ -16,11 +16,6 @@ AyuGram with visual gifts, collectible numbers and usernames.
 2. Extract `VisuGram.exe` and the `TelegramForcePortable` folder. Put them together in the same folder.
 3. Run `VisuGram.exe`.
 
-```text
-VisuGram/
-├── VisuGram.exe
-└── TelegramForcePortable/
-```
 
 ---
 
