@@ -16,11 +16,6 @@ AyuGram с визуальными подарками, коллекционным
 2. Достань из архива `VisuGram.exe` и папку `TelegramForcePortable`. Положи их вместе в одну папку.
 3. Запусти `VisuGram.exe`.
 
-```text
-VisuGram/
-├── VisuGram.exe
-└── TelegramForcePortable/
-```
 
 ---
 
